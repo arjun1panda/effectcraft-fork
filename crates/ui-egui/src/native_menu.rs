@@ -135,8 +135,10 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
             match n {
                 MenuNode::Separator => out.push(NativeNode::Separator),
                 MenuNode::Dynamic { name } => {
-                    // Recent projects / footage / presets, undo history, shortcut slots, viewers.
-                    let (entries, empty) = effectcraft_engine::menus::dynamic(&app.session, name, &crate::menus::dyn_ctx(&app.ui.workspace));
+                    // Recent projects / footage / presets, undo history, shortcut slots, viewers,
+                    // saved workspaces.
+                    let saved = app.saved_workspace_names();
+                    let (entries, empty) = effectcraft_engine::menus::dynamic(&app.session, name, &crate::menus::dyn_ctx(&app.ui.workspace, &saved));
                     if entries.is_empty()
                         && let Some(e) = empty
                     {
@@ -160,15 +162,15 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
                             shortcut: None,
                             accelerator: None,
                             enabled: crate::menus::entry_enabled(app, e),
-                            checked: None,
+                            checked: crate::menus::entry_checked(app, e),
                         }));
                     }
                 }
                 MenuNode::Submenu { label, children } => {
                     let mut kids = vec![];
                     rec(app, children, &id, &mut kids);
-                    let shown = effectcraft_engine::menus::submenu_label(&app.session, label, &crate::menus::dyn_ctx(&app.ui.workspace));
-                    out.push(NativeNode::Submenu { label: shown, children: kids });
+                    let shown = effectcraft_engine::menus::submenu_label(&app.session, label, &crate::menus::dyn_ctx(&app.ui.workspace, &[]));
+                    out.push(NativeNode::Submenu { label: crate::i18n::submenu(app, label, shown), children: kids });
                 }
                 MenuNode::Item(e) => {
                     let role = match e.command.as_str() {
@@ -180,11 +182,24 @@ pub fn build(app: &EffectcraftApp) -> NativeMenu {
                     if let Some(role) = role {
                         // Services sits just above Hide, as in every Mac app.
                         if role == Role::Hide && !services_added {
-                            out.push(NativeNode::Predefined { role: Role::Services, label: "Services".into(), command: String::new() });
+                            out.push(NativeNode::Predefined {
+                                role: Role::Services,
+                                label: if crate::i18n::japanese(app) {
+                                    "サービス"
+                                } else if crate::i18n::simplified(app) {
+                                    "服务"
+                                } else if crate::i18n::traditional(app) {
+                                    "服務"
+                                } else {
+                                    "Services"
+                                }
+                                .into(),
+                                command: String::new(),
+                            });
                             out.push(NativeNode::Separator);
                             services_added = true;
                         }
-                        out.push(NativeNode::Predefined { role, label: e.label.clone(), command: e.command.clone() });
+                        out.push(NativeNode::Predefined { role, label: crate::i18n::label(app, &e.command, &e.label).into(), command: e.command.clone() });
                         continue;
                     }
                     let shortcut = crate::menus::entry_shortcut(app, e);
@@ -388,6 +403,19 @@ mod tests {
         // The spec serializes (agents can read it).
         let v = serde_json::to_value(&spec).unwrap();
         assert!(v["menus"].as_array().is_some_and(|a| a.len() >= 9));
+    }
+
+    /// Issue #191: saved workspaces are in the native Window ▸ Workspace menu, checked while current.
+    #[test]
+    fn saved_workspaces_are_in_the_native_workspace_menu() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "window.saveWorkspaceAs", json!({"name": "My Layout"})).unwrap();
+        let entry = |app: &EffectcraftApp| build(app).items().into_iter().find(|i| i.label == "My Layout").cloned();
+        let it = entry(&app).expect("the saved workspace is listed");
+        assert_eq!((it.command.as_str(), &it.params, it.checked), ("window.workspace", &json!({"name": "My Layout"}), Some(true)));
+        crate::menus::invoke(&mut app, &ctx, "window.workspace", json!({"name": "Default"})).unwrap();
+        assert_eq!(entry(&app).and_then(|i| i.checked), Some(false));
     }
 
     #[test]

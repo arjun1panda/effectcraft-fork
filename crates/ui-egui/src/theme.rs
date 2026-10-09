@@ -114,7 +114,7 @@ impl Tokens {
             accent_hover: Color32::from_rgb(0x4a, 0xa0, 0xf5),
             text: Color32::from_rgb(0xc8, 0xc8, 0xc8),
             text_dim: Color32::from_rgb(0x9a, 0x9a, 0x9a),
-            text_faint: Color32::from_rgb(0x66, 0x66, 0x66),
+            text_faint: Color32::from_rgb(0x8c, 0x8c, 0x8c),
             icon: Color32::from_rgb(0xb4, 0xb4, 0xb4),
             icon_active: Color32::from_rgb(0xf0, 0xf0, 0xf0),
             hover: Color32::from_rgb(0x30, 0x30, 0x30),
@@ -170,7 +170,9 @@ impl Tokens {
                 tab_text_active: Color32::from_rgb(0x14, 0x14, 0x14),
                 text: Color32::from_rgb(0x22, 0x22, 0x22),
                 text_dim: Color32::from_rgb(0x5a, 0x5a, 0x5a),
-                text_faint: Color32::from_rgb(0x8c, 0x8c, 0x8c),
+                text_faint: Color32::from_rgb(0x68, 0x68, 0x68),
+                hot_text: Color32::from_rgb(0x00, 0x5a, 0x9c),
+                timecode: Color32::from_rgb(0x00, 0x5a, 0x9c),
                 icon: Color32::from_rgb(0x3c, 0x3c, 0x3c),
                 icon_active: Color32::from_rgb(0x10, 0x10, 0x10),
                 hover: Color32::from_rgb(0xd0, 0xd0, 0xd0),
@@ -280,6 +282,24 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    // Reuse the text engine's script-aware system fallback (#84), without embedding a CJK font.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use effectcraft_text::fonts;
+        let base = fonts::resolve("Inter", "Regular").face;
+        let face = fonts::face(fonts::fallback_for('あ', base));
+        if face.has_char('あ')
+            && let Some(font) = face.font()
+        {
+            // Use the already-read, parsed bytes rather than reading a font file twice.
+            let mut data = FontData::from_owned(font.data().as_bytes().to_vec());
+            data.index = face.info.index;
+            fonts.font_data.insert("japanese-system".into(), Arc::new(data));
+            for family in fonts.families.values_mut() {
+                family.push("japanese-system".into());
+            }
+        }
+    }
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
 }
@@ -307,11 +327,11 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.separator);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, t.text);
     v.widgets.inactive.bg_fill = t.field_bg;
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x2e, 0x2e, 0x2e);
+    v.widgets.inactive.weak_bg_fill = t.field_bg;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, t.field_border);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, t.text);
     v.widgets.hovered.bg_fill = t.hover;
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x3a);
+    v.widgets.hovered.weak_bg_fill = t.hover;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, t.field_border);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, t.tab_text_active);
     v.widgets.active.bg_fill = t.pressed;
@@ -325,6 +345,9 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size.y = 22.0;
         s.spacing.menu_margin = egui::Margin::same(5);
+        // Scroll bars always show (egui's float in only over the list), so long menus and lists
+        // can be dragged without a mouse wheel or touchpad (#269).
+        s.spacing.scroll = egui::style::ScrollStyle::solid();
         s.text_styles.insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Button, FontId::new(12.0, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Small, FontId::new(11.0, FontFamily::Proportional));
@@ -332,4 +355,43 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
         s.text_styles.insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
         s.animation_time = 0.1;
     });
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod japanese_font_tests {
+    #[test]
+    fn installed_japanese_fallback_is_available_in_all_ui_families() {
+        use effectcraft_text::fonts;
+        let base = fonts::resolve("Inter", "Regular").face;
+        if !fonts::face(fonts::fallback_for('あ', base)).has_char('あ') {
+            eprintln!("no Japanese system font installed; skipping glyph coverage");
+            return;
+        }
+        let ctx = egui::Context::default();
+        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // No renderer here: drop the frame's texture uploads (egui asserts on unhandled ones in debug).
+        out.textures_delta.clear();
+        ctx.fonts_mut(|fonts| {
+            for family in [
+                egui::FontFamily::Proportional,
+                egui::FontFamily::Monospace,
+                egui::FontFamily::Name("medium".into()),
+                egui::FontFamily::Name("semibold".into()),
+            ] {
+                let font = egui::FontId::new(13.0, family);
+                // epaint 0.36's has_glyph compares face keys, so it reports a false
+                // negative when a real Japanese glyph shares the replacement face.
+                // Check the rendered atlas glyph instead of that face-level predicate.
+                let missing = fonts.layout_no_wrap("\u{10ffff}".into(), font.clone(), egui::Color32::WHITE);
+                let missing_uv = missing.rows[0].glyphs[0].uv_rect;
+                for ch in "日本語コンポジションレイヤーエフェクト設定".chars() {
+                    let rendered = fonts.layout_no_wrap(ch.to_string(), font.clone(), egui::Color32::WHITE);
+                    let uv = rendered.rows[0].glyphs[0].uv_rect;
+                    assert!(uv.size.x > 0.0 && uv.size.y > 0.0, "empty {ch} in {font:?}");
+                    assert_ne!((uv.min, uv.max), (missing_uv.min, missing_uv.max), "replacement glyph for {ch} in {font:?}");
+                }
+            }
+        });
+    }
 }

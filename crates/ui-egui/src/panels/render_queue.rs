@@ -20,6 +20,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
 
 use crate::theme::Tokens;
+use crate::widgets::check_label as mark;
 use crate::{EffectcraftApp, widgets};
 
 const TOP_H: f32 = 74.0;
@@ -59,10 +60,6 @@ fn status_color(t: &Tokens, s: &RenderStatus) -> Color32 {
         RenderStatus::Unqueued => t.text_faint,
         RenderStatus::Queued => t.text,
     }
-}
-
-fn mark(on: bool, l: &str) -> String {
-    if on { format!("✓ {l}") } else { format!("   {l}") }
 }
 
 /// Render Settings menu: (label, params). `{"form": …}` entries open a form.
@@ -398,6 +395,15 @@ fn output_to_menu(it: &RenderQueueItem) -> Vec<(String, Value)> {
     v
 }
 
+/// Output To's save dialog, as After Effects' Output Movie To: it opens at the current output
+/// (folder and name) and offers the output format's extension. `None` when the host has no
+/// save dialog for other file kinds; `Some(None)` when the dialog was cancelled.
+fn pick_output(app: &EffectcraftApp, it: &RenderQueueItem) -> Option<Option<String>> {
+    let pick = app.hooks.pick_save_file.as_ref()?;
+    let default = app.session.resolve_output(it).unwrap_or_default();
+    Some(pick(&default, it.output.format.extension()))
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
@@ -406,6 +412,26 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let rendering = app.session.is_rendering();
     let available = app.session.exporter.as_ref().map(|e| e.formats()).unwrap_or_default();
     let mut actions: Vec<(&'static str, Value)> = Vec::new();
+    app.auto.add("renderQueue.drop", rect, "Drop compositions to queue");
+    if !rendering
+        && let Some(crate::panels::DragPayload::Item(id)) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(ui.ctx()).as_deref()
+        && app.session.project.comp(effectcraft_engine::project::ItemId(*id)).is_some()
+        && ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| rect.contains(pos))
+    {
+        let ids: Vec<u64> = if app.session.state.project_selection.contains(&effectcraft_engine::project::ItemId(*id)) {
+            app.session.state.project_selection.iter().filter(|i| app.session.project.comp(**i).is_some()).map(|i| i.0).collect()
+        } else {
+            vec![*id]
+        };
+        if ui.input(|i| i.pointer.any_released()) {
+            for comp in ids {
+                actions.push(("renderQueue.add", json!({"comp": comp})));
+            }
+            egui::DragAndDrop::clear_payload(ui.ctx());
+        } else {
+            p.rect_stroke(rect.shrink(2.0), 0.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+        }
+    }
     let mut forms: Vec<(RenderQueueItem, String)> = Vec::new();
     let state_id = egui::Id::new("rq-ui");
     let (mut open, mut selected): (Vec<u64>, Option<u64>) = ui.data(|d| d.get_temp(state_id).unwrap_or_default());
@@ -501,7 +527,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // ---------------------------------------------------------- items
     let list = Rect::from_min_max(pos2(rect.min.x, head.max.y), pos2(rect.max.x, rect.max.y - FOOT_H));
     let lp = p.with_clip_rect(list);
-    let mut y = list.min.y;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("rq-scroll"), list);
+    // Items scroll under the header and footer: clip their widgets (and hit tests) to the list.
+    let panel_clip = ui.clip_rect();
+    ui.set_clip_rect(list.intersect(panel_clip));
+    let mut y = list.min.y - scroll.offset;
     if queue.is_empty() {
         lp.text(pos2(list.center().x, list.min.y + 30.0), Align2::CENTER_CENTER, "The render queue is empty.", Tokens::ui(12.0), t.text_faint);
     }
@@ -667,16 +697,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let olabels: Vec<String> = omenu.iter().map(|(l, _)| l.clone()).collect();
             if let Some(i) = widgets::popup_menu(ui, oid, odd.left_bottom(), &olabels, None) {
                 if omenu[i].1.get("choose").is_some() {
-                    let default = app.session.resolve_output(it).unwrap_or_default();
-                    let picked = app
-                        .hooks
-                        .pick_save
-                        .as_ref()
-                        .and_then(|f| f(std::path::Path::new(&default).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().as_str()));
+                    // The web has no folders to choose from: its save "dialog" only names the file.
+                    let picked = pick_output(app, it).or_else(|| {
+                        let default = app.session.resolve_output(it).unwrap_or_default();
+                        let name = std::path::Path::new(&default).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        app.hooks.pick_save.as_ref().map(|f| f(&name))
+                    });
                     match picked {
-                        Some(path) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
-                        None if app.hooks.pick_save.is_none() => editing = Some((it.id, it.output.output.clone())),
-                        None => {}
+                        Some(Some(path)) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
+                        Some(None) => {}
+                        None => editing = Some((it.id, it.output.output.clone())),
                     }
                 } else {
                     let mut params = omenu[i].1.clone();
@@ -695,7 +725,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                     editing = None;
                 } else {
-                    resp.request_focus();
+                    widgets::keep_focus(ui.ctx(), &resp, &buf);
                     editing = Some((it.id, buf));
                 }
             } else {
@@ -703,14 +733,26 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 let resp = ui.interact(path_rect, egui::Id::new(("rq-path", it.id)), Sense::click());
                 let col = if resp.hovered() { t.accent_hover } else { t.hot_text };
                 lp.with_clip_rect(path_rect.intersect(list)).text(pos2(path_rect.min.x, r.center().y), Align2::LEFT_CENTER, &shown, Tokens::ui(11.5), col);
+                // Clicking the file name opens the save dialog (Output Movie To); Alt-click, or a
+                // host without one, edits the name template in place.
+                let dialog = app.hooks.pick_save_file.is_some();
                 if resp.clicked() && !rendering {
-                    editing = Some((it.id, it.output.output.clone()));
+                    let picked = if ui.input(|i| i.modifiers.alt) { None } else { pick_output(app, it) };
+                    match picked {
+                        Some(Some(path)) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
+                        Some(None) => {}
+                        None => editing = Some((it.id, it.output.output.clone())),
+                    }
                 }
-                resp.on_hover_text(format!("Template: {}\nClick to edit", it.output.output));
+                let how = if dialog { "Click to choose where to save; Alt-click to edit the template" } else { "Click to edit" };
+                resp.on_hover_text(format!("Template: {}\n{how}", it.output.output));
                 app.auto.add(&aid("outputPath"), path_rect, &shown);
             }
         }
     }
+    ui.set_clip_rect(panel_clip);
+    let content = y + scroll.offset - list.min.y;
+    scroll.end(ui, &mut app.auto, "renderQueue.scroll", content, &t);
     ui.data_mut(|d| match &editing {
         Some(e) => {
             d.insert_temp(editing_id, e.clone());
@@ -723,6 +765,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && editing.is_none()
         && !rendering
         && let Some(id) = selected
+        && app.dialog.is_none()
         && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
         && !ui.ctx().egui_wants_keyboard_input()
     {

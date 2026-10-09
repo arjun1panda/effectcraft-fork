@@ -22,6 +22,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L0 | `av1enc` | AV1 encoder from the AV1 bitstream specification: Main profile 8/10-bit 4:2:0, key + inter frames (quarter-pel motion), deblocking, for MP4 (`av01`) and WebM export |
 | L1 | `raster` | Premultiplied float images, sampling, affine and projective warps, blurs, compositing (parallel with rayon) |
 | L1 | `keyframe` | Animated values, keyframes with temporal ease and spatial Bezier, roving, hold, velocity |
+| L1 | `segment` | Swappable trained models for Roto Brush and face tracking: the `MaskModel` and `FaceModel` interfaces, a registry of open-licensed models (authors, licence, URL, size, SHA-256), PyTorch checkpoint and TensorFlow Lite readers (with an interpreter), SHA-256, MobileSAM (TinyViT + Segment Anything decoder) and MediaPipe Face Landmarker (BlazeFace + Face Mesh V2) on rayon and ndarray's safe GEMM |
 | L1 | `psd` | Photoshop PSD/PSB reader (layers, groups, masks, blend modes, text, layer effects, adjustment layers; 8/16/32-bit; RGB/CMYK/Gray/Lab) and a minimal writer, from Adobe's published format specification |
 | L1 | `path` | Bezier paths, path operators (trim, offset, round corners, zig zag, twist, merge…), stroking, coverage masks |
 | L2 | `project` | The document: items, compositions, layers, the property tree, render queue model, `.ecproj` serde |
@@ -99,7 +100,8 @@ time), primitive layers (Layer ▸ New ▸ Cube/Sphere/Plane/Torus/Cone/Cylinder
 Geometry Options), text and shape layers with Geometry Options ▸ Extrusion Depth (glyph and
 fill outlines flattened, triangulated with holes and extruded with Angular/Concave/Convex
 bevels, per character so per-character 3D carries over), and a textured card for every other
-3D layer. Shading is physically based in linear light (glTF metallic-roughness; Cook–Torrance
+3D layer. Classic 3D doesn't draw model or primitive layers, so adding one switches a Classic 3D
+comp to Advanced 3D in the same undo step, as in After Effects. Shading is physically based in linear light (glTF metallic-roughness; Cook–Torrance
 GGX specular, Smith–Schlick geometry, Schlick Fresnel, Lambert diffuse, after Karis 2013):
 parallel, spot and point lights with After Effects' falloffs, ambient lights, image-based
 light from an Environment light whose Source (or the comp's Environment Layer, Layer ▸
@@ -162,7 +164,11 @@ keys, with a nesting-depth guard.
 **Audio** is mixed by `render::audio::mix_comp` in blocks: Audio switch, solo, Audio Levels and
 the Effect > Audio effects (`effects::audio_fx`, applied per layer with a pre-roll so blocks are
 independent). Export and preview playback share it; the desktop app plays it through cpal and the
-audio clock drives preview playback (`ui-egui::audio`).
+audio clock drives preview playback (`ui-egui::audio`). The sound starts once the frames ahead
+are cached; until then, and whenever playback reaches a frame that isn't cached, every frame
+shows as it renders, silently, rather than being skipped. Layer and frame caches ignore the
+switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers: `Switches::pixels`,
+`Comp::same_pixels`), so toggling them keeps the cached frames.
 
 **Layer styles** (Layer ▸ Layer Styles; `crates/render/src/styles.rs`) render in layer space and
 may grow the layer's bounds. Drop Shadow and Outer Glow become separate passes composited below the
@@ -263,7 +269,25 @@ zero texture per size, readback staging buffers are reused, and the 8/16 bpc qua
 each layer is fused into the layer's composite kernel; under test, pooled scratch images start
 as NaNs (a kernel that skips pixels fails the oracle) and validation errors panic. The desktop viewer builds the
 `Gpu` on egui-wgpu's device and shows frames from GPU textures without reading them back
-(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`) and CI use the CPU. On the web
+(`ui-egui::frames`); headless renders, the CLI (unless `--gpu`) and CI use the CPU. Outside
+tests, device errors are logged rather than fatal. A viewer frame that runs out of video memory
+(`Gpu::within_memory`) renders on the CPU, the uploaded layers and pooled textures are freed, and
+the RAM preview keeps half as many GPU frames from then on. A frame whose render panics is
+rendered again on the CPU or released, never left in progress. Native readbacks and timing waits
+share a finite deadline; failure retires pending readbacks exactly once, and late results are
+discarded. The desktop executable and browser page own their shared device's error/loss handlers and forward
+failures to the compositor through a weak notifier. Libraries borrowing a device preserve its
+host's handlers. A host fault disables shared-device preview acceleration without editing the project or its
+renderer preference; materialized CPU frames remain usable and late GPU textures cannot return
+to the preview cache. Scoped allocation failures retain the adaptive budget/CPU retry behavior.
+
+**Recovery boundary:** the host installs handlers through eframe's CreationContext, after egui's
+presentation pipelines but before EffectCraft's pipelines. This does not cover that earlier egui
+startup window. eframe 0.36.2 supports lost-surface recreation, not replacing its live device and
+all presentation resources. Device loss therefore requires restarting the presentation backend;
+CPU compositing alone cannot restore that display. No automatic restart or persistent safe-mode
+sentinel is implemented here. Browser scope futures are not synchronously awaited; the browser page
+forwards shared-device errors, while owned worker devices install their own handlers. On the web
 (WebGPU) the GPU composites viewer frames; steps that need a readback fall back to the CPU (the
 Info panel's pixel readout reads GPU frames back asynchronously). **GPU particles**
 (`effects::psim`, `gpu::particles`): CC Particle World, CC Particle Systems II and Particle
@@ -294,8 +318,9 @@ hierarchical block-matching optical flow and a bidirectional warp (Pixel Motion,
 its nested layers straight into the parent with concatenated transforms (one resample), so
 nested blend modes and adjustment layers act on the parent's layers; nested 3D layers use the
 parent's camera and lights and, when the precomp layer is 3D, are depth-sorted with the parent's
-3D run. Masks, effects or styles force a flattened render. On text and shape layers the switch is
-Continuously Rasterize: the source is rasterised at its on-screen scale. Quality: Draft samples
+3D run. Masks, effects or styles force a flattened render. Text layers are always rasterised at
+their on-screen scale; on shape layers and vector footage the switch is Continuously Rasterize and
+does the same. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
 
@@ -334,6 +359,10 @@ components inside it, and an active-shape point distribution model trained on sy
 shapes (our own generator, no external weights) that fills and checks the landmarks. The outline
 keys the Mask Path; Detailed Features keys a Face Track Points effect, and
 `track.extractFaceMeasurements` derives a keyed Face Measurements effect (and copies its keys).
+With a trained face model chosen (`effectcraft_segment::face::FaceModel`, Settings ▸ Face
+Tracking; `Session::models` hands it to the mask track), `FaceTracker::new_with` lets the model
+find the face in the mask and follow it; the model's outline and named points replace the
+classical steps, and chin and jaw still come from the outline so the measurements agree.
 
 **Warp Stabilizer** (`effects::warp_stab`, `engine::warp`): `warp.analyze` renders the layer's
 input to the effect (`Renderer::layer_input`: source, masks and the effects above it) for every
@@ -392,7 +421,10 @@ parameter with the base frame and segmentation span. Each frame is segmented by 
 (Boykov–Jolly hard constraints, GrabCut colour mixtures, our own Boykov–Kolmogorov max-flow,
 coarse to fine) and propagated to the next frame by warping the matte with block optical flow and
 re-cutting in a Search Radius band; frames with correction strokes are re-cut with the warped
-matte as a soft prior. Refine Edge bands get guided-filter + closed-form matting and
+matte as a soft prior. With Version 2.0 / 3.0 and a trained model chosen (`effectcraft_segment`,
+Settings ▸ Roto Brush), the model's foreground probability, prompted by the strokes or by the
+warped matte, becomes a strong prior for the same cut (falling back to the classic result when it
+disagrees with the flow); the model's id is part of the chain seed. Refine Edge bands get guided-filter + closed-form matting and
 foreground-colour decontamination. Segmentations are derived data: each frame's chain key (Input
 Key, settings, strokes from the base frame out) indexes a process-wide cache that renders fill on
 demand (`self_at`) and `roto.propagate` fills in the background; `Session::edit` keeps the Input
@@ -543,8 +575,9 @@ What keeps it fast:
 
 - **Lazy open.** A project file carries its footage metadata, so File ▸ Open is read + parse +
   swap. Nothing is decoded until a frame needs it, expressions compile on first evaluation
-  (cached by text), and system fonts are scanned only when a text layer asks for a family that
-  isn't bundled. The footage files are checked afterwards in the background (`footage.check`, a
+  (cached by text), and system fonts are scanned on first need (a text layer asking for a family
+  that isn't bundled, or a font menu or `text.fonts` listing the families); the desktop app starts
+  that scan on a background thread at launch, reading name tables only. The footage files are checked afterwards in the background (`footage.check`, a
   "Checking footage" job in the Progress panel): missing items are flagged, items saved without
   metadata are probed, and the project is not marked modified. The desktop app does this after
   every open (`Session::check_footage_on_open`); headless sessions run `footage.check {wait:true}`.

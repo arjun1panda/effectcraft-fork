@@ -4,8 +4,10 @@ pub mod anim_tools;
 pub mod camera_tracker_ui;
 pub mod comp_settings;
 pub mod content_fill_panel;
+pub mod delete_items;
 pub mod dialogs;
 pub mod dialogs_3d;
+pub mod ease_presets;
 pub mod effect_controls;
 pub mod effects_presets;
 pub mod essential;
@@ -48,9 +50,11 @@ pub mod timeline;
 pub mod tracker;
 pub mod unsaved;
 pub mod viewer;
+pub mod viewer_drop;
 pub mod viewer_overlays;
 pub mod viewer_text;
 pub mod viewer_tools;
+pub mod viewers;
 pub mod waveform;
 
 use effectcraft_engine::Session;
@@ -80,15 +84,16 @@ pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
     effectcraft_engine::commands::time::display_time(session, comp, t)
 }
 
+/// Spacebar held outside a text field: the Hand tool (drags pan the viewer and scroll the
+/// Timeline).
+pub(crate) fn space_hand(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(egui::Key::Space)) && !ctx.egui_wants_keyboard_input()
+}
+
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect) {
     match p {
-        PanelKind::Composition => {
-            if app.ui.start_screen {
-                home::show(app, ui, rect);
-            } else {
-                viewer::show(app, ui, rect)
-            }
-        }
+        PanelKind::Composition => viewers::show(app, ui, 0, rect),
+        PanelKind::Viewer(n) => viewers::show(app, ui, n, rect),
         PanelKind::Timeline => timeline::show(app, ui, rect),
         PanelKind::Project => project::show(app, ui, rect),
         PanelKind::EffectControls => effect_controls::show(app, ui, rect),
@@ -123,6 +128,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rec
         PanelKind::ContentAwareFill => content_fill_panel::show(app, ui, rect),
         PanelKind::CreateNullsFromPaths => path_vr_panels::create_nulls(app, ui, rect),
         PanelKind::VrCompEditor => path_vr_panels::vr_editor(app, ui, rect),
+        PanelKind::EasePresets => ease_presets::show(app, ui, rect),
     }
 }
 
@@ -167,8 +173,9 @@ pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
                         close = true;
                     }
                 }
-                PanelKind::Composition => {
+                PanelKind::Composition | PanelKind::Viewer(_) => {
                     for (label, cmd) in [
+                        ("New Viewer", "view.newViewer"),
                         ("Composition Settings…", "app.compSettings"),
                         ("View Options…", "view.layerControls"),
                         ("Show Grid", "view.grid"),
@@ -186,7 +193,7 @@ pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
             }
         });
     });
-    if close || (ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !area.response.hovered()) {
+    if close || crate::widgets::pressed_outside(ui.ctx(), &area.response) {
         ui.ctx().data_mut(|d| d.remove::<(PanelKind, egui::Pos2)>(id));
     }
 }

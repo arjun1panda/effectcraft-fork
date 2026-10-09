@@ -12,10 +12,10 @@ pub const ISSUES: &str = "https://github.com/storytold/effectcraft/issues";
 /// Sibling apps of the ArtCraft family: (name, what it is, GitHub repo, app page).
 pub const SIBLINGS: &[(&str, &str)] = &[
     ("PhotoCraft", "photocraft"),
-    ("DrawCraft", "drawcraft"),
+    ("VectorCraft", "vectorcraft"),
     ("FilmCraft", "filmcraft"),
     ("LightCraft", "lightcraft"),
-    ("PrintCraft", "printcraft"),
+    ("PdfCraft", "pdfcraft"),
     ("DesignCraft", "designcraft"),
 ];
 

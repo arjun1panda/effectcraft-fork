@@ -34,7 +34,7 @@ mod layer_time;
 pub(crate) mod link;
 mod liquify;
 mod lottie;
-mod markers;
+pub mod markers;
 mod mask;
 pub mod mask_interp;
 pub(crate) mod model3d;
@@ -54,7 +54,8 @@ pub mod roto_cmds;
 mod scene_detect;
 pub mod scripts;
 mod settings;
-mod shape_stroke;
+pub mod shape_stroke;
+pub mod shape_tool;
 mod stubs;
 mod styles;
 mod text_anim;
@@ -133,6 +134,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
     SPECS.get_or_init(|| {
         let mut v = Vec::new();
         v.extend(file::specs());
+        v.extend(crate::models::specs());
         v.extend(edit::specs());
         v.extend(comp::specs());
         v.extend(layer::specs());
@@ -164,6 +166,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(view::specs());
         v.extend(viewer_cmds::specs());
         v.extend(shape_stroke::specs());
+        v.extend(shape_tool::specs());
         v.extend(focus::specs());
         v.extend(key_labels::specs());
         v.extend(key_transform::specs());
@@ -203,6 +206,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::storage::specs());
         v.extend(crate::learn::specs());
         v.extend(crate::templates::specs());
+        v.extend(crate::ease_presets::specs());
         v.extend(crate::preview::specs());
         v
     })
@@ -441,9 +445,10 @@ pub(crate) fn merge_p(p: &Value) -> Option<&str> {
 
 /// `comp`: item id or name; default the active comp.
 pub(crate) fn comp_id(s: &Session, p: &Value) -> Result<ItemId> {
+    let missing = |v: &Value| EngineError::NoSuchComp(v.to_string());
     match p.get("comp") {
-        Some(Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or(EngineError::NoComp),
-        Some(Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or(EngineError::NoComp),
+        Some(v @ Value::Number(n)) => n.as_u64().map(ItemId).filter(|id| s.project.comp(*id).is_some()).ok_or_else(|| missing(v)),
+        Some(v @ Value::String(name)) => s.project.items.values().find(|i| &i.name == name && i.as_comp().is_some()).map(|i| i.id).ok_or_else(|| missing(v)),
         _ => s.active_comp_id().ok_or(EngineError::NoComp),
     }
 }
@@ -515,6 +520,13 @@ pub(crate) fn unlocked(s: &Session, cid: ItemId, ids: Vec<LayerId>, cmd: &str) -
         }
         _ => Ok(ids.into_iter().filter(|id| !locked(id)).collect()),
     }
+}
+
+/// `visible: [{layer, prop}]`: the properties the Timeline shows (J / K and Select All
+/// Keyframes use only those, as in After Effects). `None` when not given.
+pub(crate) fn visible_p(p: &Value) -> Option<Vec<(LayerId, effectcraft_project::Uid)>> {
+    let a = p.get("visible")?.as_array()?;
+    Some(a.iter().filter_map(|v| Some((LayerId(v.get("layer")?.as_u64()?), v.get("prop")?.as_u64()?))).collect())
 }
 
 /// `time` (seconds) or `frame` param, else the CTI.

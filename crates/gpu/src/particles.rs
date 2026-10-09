@@ -193,29 +193,18 @@ pub(crate) fn simulate(g: &GpuContext, req: &SimRequest) -> Option<Vec<SimPartic
     enc.copy_buffer_to_buffer(&next, 0, &read, 0, size);
     g.queue.submit([enc.finish()]);
     if let (Some(d), Some(k)) = (&deferred, key) {
+        let row = usize::try_from(size).ok()?;
         let done = d.start(k, n, 1, [0.0; 2], 1.0);
-        let b = read.clone();
-        read.map_async(wgpu::MapMode::Read, .., move |r| {
-            let out = r.ok().and_then(|_| b.get_mapped_range(..).ok().map(|v| v.to_vec()));
-            b.unmap();
-            done(out);
-        });
+        g.map_readback(&read, row, row, 1, move |r| done(r.map_err(|e| log::error!("gpu particle readback: {e}")).ok()));
         #[cfg(not(target_arch = "wasm32"))]
-        let _ = g.device.poll(wgpu::PollType::Poll);
+        let _ = g.poll_readbacks(wgpu::PollType::Poll);
         keep_checkpoint(g, req, n, next);
         d.miss();
         return Some(vec![]);
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    read.map_async(wgpu::MapMode::Read, .., move |r| {
-        let _ = tx.send(r);
-    });
-    g.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-    rx.recv().ok()?.ok()?;
-    let view = read.get_mapped_range(..).ok()?;
-    let parts = parse(&view);
-    drop(view);
-    read.unmap();
+    let row = usize::try_from(size).ok()?;
+    let bytes = g.read_buffer(&read, row, row, 1).map_err(|e| log::error!("gpu particle readback: {e}")).ok()?;
+    let parts = parse(&bytes);
     keep_checkpoint(g, req, n, next);
     Some(parts)
 }
@@ -233,8 +222,10 @@ fn sim_key(req: &SimRequest) -> u128 {
 
 /// Live particles of a state buffer's bytes.
 fn parse(bytes: &[u8]) -> Vec<SimParticle> {
-    let f: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-    f.chunks_exact(12)
+    let f: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    f.as_chunks::<12>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(_, s)| s[9] != 0.0)
         .map(|(id, s)| SimParticle { p: [s[0], s[1], s[2]], v: [s[4], s[5], s[6]], age: s[3], life: s[7], rnd: s[8], id: id as u32 })

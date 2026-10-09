@@ -46,6 +46,14 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         fe!("playback.cacheWhenIdle", "Cache Frames When Idle", ["Composition", "Preview"], None, "{value?}", always),
         fe!("playback.audio", "Audio", ["Composition", "Preview"], None, "{value?: include audio in previews}", always),
+        fe!(
+            "playback.scrubAudio",
+            "Scrub Audio",
+            [],
+            None,
+            "{time? (s, default the current time)} — plays one frame of the comp's audio there (Ctrl/Cmd-drag the current time)",
+            has_comp
+        ),
         // Viewer.
         fe!("view.zoomIn", "Zoom In", ["View"], Some("."), "{}", has_comp),
         fe!("view.zoomOut", "Zoom Out", ["View"], Some(","), "{}", has_comp),
@@ -64,13 +72,21 @@ pub fn specs() -> Vec<CommandSpec> {
         fe!("view.options", "View Options...", ["View"], Some("Cmd+Alt+U"), "{}", has_comp),
         fe!("view.layerControls", "Show Layer Controls", ["View"], Some("Cmd+Shift+H"), "{value?}", always),
         fe!("view.fullScreen", "Enter Full Screen", ["View"], Some("Ctrl+Cmd+F"), "{}", always),
+        fe!(
+            "view.newViewer",
+            "New Viewer",
+            ["View"],
+            Some("Alt+Shift+N"),
+            "{} — another Composition viewer of the active comp; the one in use is locked",
+            has_comp
+        ),
         // Panels and workspaces.
         fe!(
             "window.panel",
             "Show Panel",
             [],
             None,
-            "{panel: project|effectControls|composition|layer|timeline|info|audio|preview|effectsPresets|properties|character|paragraph|align|tracker|wiggler|smoother|motionSketch|paint|brushes|renderQueue|flowchart|history|markers|tools|lumetriScopes|footage|mediaBrowser|metadata|progress|contentAwareFill|createNullsFromPaths|vrCompEditor}",
+            "{panel: project|effectControls|composition|layer|timeline|info|audio|preview|effectsPresets|properties|character|paragraph|align|tracker|wiggler|smoother|motionSketch|paint|brushes|renderQueue|flowchart|history|markers|tools|lumetriScopes|footage|mediaBrowser|metadata|progress|contentAwareFill|createNullsFromPaths|vrCompEditor|easePresets}",
             always
         ),
         fe!(

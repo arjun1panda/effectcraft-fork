@@ -26,8 +26,8 @@ use effectcraft_engine::project::{ItemId, ItemKind, LayerSource, ParamUi, Proper
 use egui::{Rect, RichText};
 use serde_json::{Value, json};
 
-use crate::EffectcraftApp;
 use crate::panels::DragPayload;
+use crate::{EffectcraftApp, widgets};
 
 type Actions = Vec<(String, Value)>;
 
@@ -296,13 +296,13 @@ fn name_label(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, c: &EgCo
         Some(mut buf) => {
             let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0));
             app.auto.add(&format!("essential.control.{}.rename", c.id), r.rect, &c.name);
-            r.request_focus();
-            if r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if !buf.trim().is_empty() && buf.trim() != c.name {
+            if r.lost_focus() {
+                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) && !buf.trim().is_empty() && buf.trim() != c.name {
                     actions.push(("essential.rename".into(), json!({"comp": cid.0, "control": c.id, "name": buf.trim()})));
                 }
                 ui.ctx().data_mut(|d| d.remove::<String>(edit_id));
             } else {
+                widgets::keep_focus(ui.ctx(), &r, &buf);
                 ui.ctx().data_mut(|d| d.insert_temp(edit_id, buf));
             }
         }
@@ -320,8 +320,8 @@ fn name_label(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, c: &EgCo
 fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Option<ControlType>, p: &Property, v: &KV) -> Option<Value> {
     let ty = ty?;
     let mut out = None;
-    let rect;
-    match ty {
+
+    let rect = match ty {
         ControlType::Text => {
             let cur = match v {
                 KV::Text(d) => d.text.clone(),
@@ -339,7 +339,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
                 }
                 ui.ctx().data_mut(|d| d.remove::<String>(id));
             }
-            rect = r.rect;
+            r.rect
         }
         ControlType::Color => {
             let c = v.as_color();
@@ -349,7 +349,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
                 let u = rgba.to_rgba_unmultiplied();
                 out = Some(json!([u[0], u[1], u[2], u[3]]));
             }
-            rect = r.rect;
+            r.rect
         }
         ControlType::Checkbox => {
             let mut on = v.as_bool();
@@ -357,7 +357,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if r.changed() {
                 out = Some(json!(on));
             }
-            rect = r.rect;
+            r.rect
         }
         ControlType::Dropdown => {
             let opts = match &p.ui {
@@ -372,7 +372,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
                     }
                 }
             });
-            rect = r.response.rect;
+            r.response.rect
         }
         ControlType::Point => {
             let mut a = v.as_vec2();
@@ -381,7 +381,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if r1.changed() || r2.changed() {
                 out = Some(json!(a));
             }
-            rect = r1.rect.union(r2.rect);
+            r1.rect.union(r2.rect)
         }
         ControlType::Angle => {
             let mut a = v.as_f64();
@@ -389,7 +389,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if r.changed() {
                 out = Some(json!(a));
             }
-            rect = r.rect;
+            r.rect
         }
         ControlType::Font => {
             // Family (from the installed fonts), style and size; the text stays as it is.
@@ -421,7 +421,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if changed || r3.changed() {
                 out = serde_json::to_value(&d).ok();
             }
-            rect = r1.response.rect.union(r3.rect);
+            r1.response.rect.union(r3.rect)
         }
         ControlType::Scale => {
             // One percentage for every axis.
@@ -431,7 +431,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if r.changed() {
                 out = Some(json!(vec![x; comps.len().max(1)]));
             }
-            rect = r.rect;
+            r.rect
         }
         ControlType::Slider | ControlType::Media => {
             let mut x = v.as_f64();
@@ -442,9 +442,9 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             if r.changed() {
                 out = Some(json!(x));
             }
-            rect = r.rect;
+            r.rect
         }
-    }
+    };
     app.auto.add(auto, rect, &p.name);
     out
 }

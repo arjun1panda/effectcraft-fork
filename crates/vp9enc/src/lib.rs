@@ -341,6 +341,12 @@ impl Vp9Encoder {
             }
             out.extend_from_slice(&t);
         }
+        // A frame mustn't end in a byte that reads as a superframe marker (0b110xxxxx, Annex B):
+        // decoders would take its last bytes for a superframe index and reject the frame. The
+        // last tile's bool-coded data may end in zero padding (9.2.3), so a zero byte fixes it.
+        if out.last().is_some_and(|b| b & 0xe0 == 0xc0) {
+            out.push(0);
+        }
         // State for the next frame.
         self.mvs = mi.iter().map(|m| if m.inter { m.mv } else { Mv::ZERO }).collect();
         self.reference = Some(planes);
@@ -452,6 +458,6 @@ pub fn rgba_to_yuv420(rgba: &[u8], w: u32, h: u32, full_range: bool) -> (Vec<u8>
 pub fn alpha_to_yuv420(rgba: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let (w, h) = (w as usize, h as usize);
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let y: Vec<u8> = rgba.chunks_exact(4).take(w * h).map(|p| p[3]).collect();
+    let y: Vec<u8> = rgba.as_chunks::<4>().0.iter().take(w * h).map(|p| p[3]).collect();
     (y, vec![128; cw * ch], vec![128; cw * ch])
 }

@@ -33,7 +33,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         if ((flags & 2u) != 0u) {
             d = vec4<f32>(0.0);
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z);
+        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
     let r0 = P.f[0];
@@ -52,7 +52,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (stencil && (flags & 1u) == 0u) {
             d = blend_pixel(mode, d, vec4<f32>(0.0), 0.5);
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z);
+        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
     var s = sample(src, sampling, px, py);
@@ -60,11 +60,11 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (s.w > 0.0) {
             d = d + s * P.f[3].y;
         }
-        store_q(vec2<i32>(x, y), d, P.f[3].z);
+        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
     if (s.w <= 0.0 && !stencil) {
-        store_q(vec2<i32>(x, y), d, P.f[3].z);
+        store_q(vec2<i32>(x, y), d, P.f[3].z, P.f[3].w);
         return;
     }
     let op = P.f[3].x;
@@ -75,7 +75,7 @@ fn warp_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mode == 1u || mode == 2u) {
         n = hash_noise(u32(x), u32(y), seed);
     }
-    store_q(vec2<i32>(x, y), blend_pixel(mode, d, s, n), P.f[3].z);
+    store_q(vec2<i32>(x, y), blend_pixel(mode, d, s, n), P.f[3].z, P.f[3].w);
 }
 
 // Blend `src` (same size) onto `aux` (Image::blend_from).
@@ -91,7 +91,7 @@ fn blend_full(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = textureLoad(aux, p, 0);
     var s = textureLoad(src, p, 0);
     if (s.w <= 0.0 && !is_stencil(mode)) {
-        store_q(p, d, P.f[0].y);
+        store_q(p, d, P.f[0].y, P.f[0].z);
         return;
     }
     s = s * P.f[0].x;
@@ -99,7 +99,7 @@ fn blend_full(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mode == 1u || mode == 2u) {
         n = hash_noise(gid.x, gid.y, P.u[0].z);
     }
-    store_q(p, blend_pixel(mode, d, s, n), P.f[0].y);
+    store_q(p, blend_pixel(mode, d, s, n), P.f[0].y, P.f[0].z);
 }
 
 // Track matte: `src` × matte factor of `aux`. u[0].x = 0 alpha, 1 alpha inverted, 2 luma,
@@ -179,24 +179,24 @@ fn quantize(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    textureStore(out, p, quantize_px(textureLoad(src, p, 0), P.f[0].x));
+    textureStore(out, p, quantize_px(textureLoad(src, p, 0), P.f[0].x, P.f[0].y));
 }
 
-fn quantize_px(s: vec4<f32>, levels: f32) -> vec4<f32> {
-    let inv = 1.0 / levels;
-    let a = round_away(clamp(s.w, 0.0, 1.0) * levels) * inv;
+fn quantize_px(s: vec4<f32>, levels: f32, inv: f32) -> vec4<f32> {
+    // Use the CPU-rounded reciprocal to avoid backend-dependent division.
+    let a = floor(clamp(s.w, 0.0, 1.0) * levels + 0.5) * inv;
     var o = vec4<f32>(0.0, 0.0, 0.0, a);
-    o.x = round_away(clamp(s.x, 0.0, a) * levels) * inv;
-    o.y = round_away(clamp(s.y, 0.0, a) * levels) * inv;
-    o.z = round_away(clamp(s.z, 0.0, a) * levels) * inv;
+    o.x = floor(clamp(s.x, 0.0, a) * levels + 0.5) * inv;
+    o.y = floor(clamp(s.y, 0.0, a) * levels + 0.5) * inv;
+    o.z = floor(clamp(s.z, 0.0, a) * levels + 0.5) * inv;
     return o;
 }
 
 // Store a compositing result, clamped and quantised to `levels` when > 0 (8/16 bpc: the comp
 // after a layer, fused into the layer's composite).
-fn store_q(p: vec2<i32>, v: vec4<f32>, levels: f32) {
+fn store_q(p: vec2<i32>, v: vec4<f32>, levels: f32, inv: f32) {
     if (levels > 0.0) {
-        textureStore(out, p, quantize_px(v, levels));
+        textureStore(out, p, quantize_px(v, levels, inv));
     } else {
         textureStore(out, p, v);
     }
@@ -535,6 +535,36 @@ fn value_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     return a + (b - a) * fz;
 }
 
+// Fractal Noise's Soft Linear (effects::noise3::typed_noise): the quadratic B-spline over the
+// 3 × 3 lattice values around the nearest one, faded along evolution, and SOFT_LINEAR_GAIN.
+const SOFT_LINEAR_GAIN: f32 = (181.0 / 231.0) / 0.55;
+
+fn bspline(t: f32) -> vec3<f32> {
+    let s = 1.0 - t;
+    return vec3<f32>(0.5 * s * s, 0.5 + t * s, 0.5 * t * t);
+}
+
+fn soft_linear_slice(ix: i32, iy: i32, iz: i32, wx: vec3<f32>, wy: vec3<f32>, seed: u32) -> f32 {
+    var sum = 0.0;
+    for (var j = 0; j < 3; j++) {
+        let y = iy + j - 1;
+        sum += wy[j] * (wx.x * lattice(ix - 1, y, iz, seed) + wx.y * lattice(ix, y, iz, seed) + wx.z * lattice(ix + 1, y, iz, seed));
+    }
+    return sum;
+}
+
+fn soft_linear_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    let x0 = floor(x + 0.5);
+    let y0 = floor(y + 0.5);
+    let z0 = floor(z);
+    let wx = bspline(x + 0.5 - x0);
+    let wy = bspline(y + 0.5 - y0);
+    let a = soft_linear_slice(i32(x0), i32(y0), i32(z0), wx, wy, seed);
+    let b = soft_linear_slice(i32(x0), i32(y0), i32(z0) + 1, wx, wy, seed);
+    let n = a + (b - a) * fade(z - z0);
+    return 0.5 + (n - 0.5) * SOFT_LINEAR_GAIN;
+}
+
 // generate::put: blend a generated straight colour (alpha ga) over the pixel.
 fn put(px: vec4<f32>, g: vec3<f32>, ga: f32, blend_orig: f32) -> vec4<f32> {
     let g2 = vec4<f32>(g * ga, ga);
@@ -800,7 +830,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (o + 1u == n_oct && frac > 0.0) {
                     w = frac;
                 }
-                var n = value_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
+                var n = soft_linear_noise(u * f, v * f, evo + f32(o) * 7.31, seed + o);
                 let s = n * 2.0 - 1.0;
                 if (kind == 1u) {
                     n = 1.0 - s * s;

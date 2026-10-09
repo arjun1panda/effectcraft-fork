@@ -242,6 +242,22 @@ fn keyframes_eases_and_interpolation() {
 }
 
 #[test]
+fn spatial_tangents_round_trip() {
+    let mut s = session();
+    let o = ok(
+        &mut s,
+        r#"
+        var c = app.project.items.addComp("T", 100, 100, 1, 2, 25);
+        var p = c.layers.addNull().transform.position;
+        p.setValuesAtTimes([0, 1], [[0, 0], [100, 0]]);
+        p.setSpatialTangentsAtKey(1, [0, 0], [30, 40]);
+        [p.keyOutSpatialTangent(1)[0], p.keyOutSpatialTangent(1)[1], p.keyInSpatialTangent(1)[0]]
+        "#,
+    );
+    assert_eq!(o.result, json!([30, 40, 0]));
+}
+
+#[test]
 fn text_documents() {
     let mut s = session();
     let o = ok(
@@ -360,6 +376,12 @@ fn engine_entry_points() {
     // Scripts can't run scripts.
     let r = s.execute("script.run", json!({"code": "app.run('script.run', {code: '1'})"})).unwrap();
     assert!(r["error"]["message"].as_str().unwrap().contains("scripts can't run scripts"), "{r}");
+    // Compiled .jsxbin scripts (by name or by their header) are unsupported, not a SyntaxError
+    // at 1:1 (#176).
+    for p in [json!({"code": "@JSXBIN@ES@2.0@MyBbyBn0AB", "name": "compiled.bin"}), json!({"code": "1", "name": "/x/compiled.JSXBIN"})] {
+        let e = s.execute("script.run", p.clone()).unwrap_err().to_string();
+        assert!(e.contains(".jsxbin scripts are not supported: run the .jsx source"), "{p}: {e}");
+    }
     // File ▸ Scripts ▸ Run Script File… runs .jsx as JavaScript.
     let dir = std::env::temp_dir().join(format!("ec-script-file-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

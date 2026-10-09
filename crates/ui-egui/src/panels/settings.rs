@@ -8,6 +8,7 @@
 //! `settings.cancel`, `settings.previous`, `settings.next`.
 
 use effectcraft_engine::prefs::{Item, Kind, Page, pages};
+use effectcraft_engine::segment::Task;
 use egui::{Color32, RichText, vec2};
 use serde_json::{Value, json};
 
@@ -28,6 +29,8 @@ enum Act {
     Run(String, Value),
     PickFolder(String),
     PickProject(String),
+    /// Install from File (a downloaded weights file) for a task's models.
+    PickModel(Task),
 }
 
 fn hex(c: [u8; 3]) -> String {
@@ -61,6 +64,7 @@ fn page_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, page: &Page, cur: &Value
             }
             Item::Labels => labels_ui(app, ui, cur, acts),
             Item::BrowserStorage => browser_storage_ui(app, ui, t, acts),
+            Item::Models(task) => models_ui(app, ui, t, acts, task),
             Item::AudioDevices { key } => {
                 let devices: Vec<String> = app.hooks.audio_devices.as_ref().map(|f| f()).unwrap_or_default();
                 let sel = get(key).as_str().unwrap_or("").to_string();
@@ -207,6 +211,105 @@ pub fn human_bytes(b: u64) -> String {
     if u == 0 { format!("{b} bytes") } else { format!("{v:.1} {}", units[u]) }
 }
 
+/// Settings ▸ Roto Brush and Settings ▸ Face Tracking: a task's models (`roto.models`,
+/// `face.models`): choose one; download, install from a file or remove the trained ones; who made
+/// them, their licence, size and source.
+fn models_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, acts: &mut Vec<Act>, task: Task) {
+    let (prefix, user) = match task {
+        Task::Mask => ("roto", "Roto Brush"),
+        Task::Face => ("face", "Face tracking"),
+    };
+    let Ok(info) = app.session.execute(&format!("{prefix}.models"), json!({})) else { return };
+    let web = cfg!(target_arch = "wasm32");
+    let busy = info["busy"].as_str().map(str::to_string);
+    for m in info["models"].as_array().into_iter().flatten() {
+        let id = m["id"].as_str().unwrap_or_default().to_string();
+        let name = m["name"].as_str().unwrap_or_default();
+        let classic = id == effectcraft_engine::segment::CLASSICAL;
+        let (installed, selected, active) =
+            (m["installed"].as_bool().unwrap_or(false), m["selected"].as_bool().unwrap_or(false), m["active"].as_bool().unwrap_or(false));
+        ui.add_space(6.0);
+        egui::Frame::new().fill(t.field_bg).corner_radius(6.0).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let r = ui.radio(selected, RichText::new(name).font(Tokens::semibold(12.5)));
+                reg(app, &format!("settings.{prefix}.model.{id}"), &r, name);
+                if r.clicked() && !selected {
+                    acts.push(Act::Run(format!("{prefix}.model.select"), json!({"id": id})));
+                }
+                let state = match (active, installed, selected) {
+                    (true, _, _) => "In use".to_string(),
+                    _ if classic => "Built in".to_string(),
+                    (false, true, true) if busy.is_some() => "Loading…".to_string(),
+                    (false, true, _) => "Installed".to_string(),
+                    (false, false, true) => format!("Not installed: {user} uses the classic engine"),
+                    _ => "Not installed".to_string(),
+                };
+                ui.label(RichText::new(state).color(if active { t.accent } else { t.text_dim }));
+            });
+            ui.label(RichText::new(m["description"].as_str().unwrap_or_default()).color(t.text_dim));
+            if let Some(by) = m["authors"].as_str() {
+                ui.label(RichText::new(format!("By {by}")).color(t.text_dim));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Licence: {}", m["licence"].as_str().unwrap_or_default())).color(t.text_dim));
+                if let Some(size) = m["size"].as_u64() {
+                    ui.label(RichText::new(format!("·  {}", human_bytes(size))).color(t.text_dim));
+                }
+                for (label, key) in [("Project page", "homepage"), ("Licence", "licenceUrl")] {
+                    if let Some(url) = m[key].as_str() {
+                        let r = ui.link(label);
+                        if r.clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        }
+                    }
+                }
+            });
+            if classic {
+                return;
+            }
+            ui.horizontal(|ui| {
+                if !installed && !web {
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Download"));
+                    reg(app, &format!("settings.{prefix}.download.{id}"), &r, "Download");
+                    if r.clicked() {
+                        acts.push(Act::Run(format!("{prefix}.model.download"), json!({"id": id})));
+                    }
+                }
+                if !web {
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Install from File…"));
+                    reg(app, &format!("settings.{prefix}.install.{id}"), &r, "Install from File");
+                    if r.clicked() {
+                        acts.push(Act::PickModel(task));
+                    }
+                }
+                if installed {
+                    let r = ui.add_enabled(busy.is_none(), egui::Button::new("Remove"));
+                    reg(app, &format!("settings.{prefix}.remove.{id}"), &r, "Remove");
+                    if r.clicked() {
+                        acts.push(Act::Run(format!("{prefix}.model.remove"), json!({"id": id})));
+                    }
+                }
+            });
+        });
+    }
+    if let Some(b) = &busy {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(b);
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    if let Some(e) = info["error"].as_str() {
+        ui.label(RichText::new(e).color(t.danger));
+    }
+    if web {
+        ui.label(RichText::new("Trained models are available in the desktop app; the browser uses the classic engine.").color(t.text_dim));
+    } else if let Some(f) = info["folder"].as_str() {
+        ui.label(RichText::new(format!("Models folder: {f}")).color(t.text_faint));
+    }
+}
+
 /// Settings ▸ Disk ▸ Browser Storage (the web app's storage manager, `storage.*`): where the
 /// data lives, the origin's usage and quota, persistent storage, and Clear buttons.
 fn browser_storage_ui(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, acts: &mut Vec<Act>) {
@@ -325,32 +428,34 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut acts: Vec<Act> = vec![];
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Settings", vec2(820.0, 600.0), t, |ui| {
-        let body_h = 470.0;
+        let body_h = (ctx.content_rect().height() - 170.0).clamp(120.0, 470.0);
         ui.allocate_ui_with_layout(vec2(ui.available_width(), body_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
             ui.set_height(body_h);
             // Page list (left, like After Effects).
             ui.vertical(|ui| {
                 ui.set_width(180.0);
-                for p in &all {
-                    let (r, resp) = ui.allocate_exact_size(vec2(176.0, 24.0), egui::Sense::click());
-                    let sel = page == p.id;
-                    if sel {
-                        ui.painter().rect_filled(r, 3.0, t.accent);
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(r, 3.0, t.hover);
+                egui::ScrollArea::vertical().id_salt("settings-pages").max_height(body_h).auto_shrink([false, false]).show(ui, |ui| {
+                    for p in &all {
+                        let (r, resp) = ui.allocate_exact_size(vec2(176.0, 24.0), egui::Sense::click());
+                        let sel = page == p.id;
+                        if sel {
+                            ui.painter().rect_filled(r, 3.0, t.accent);
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(r, 3.0, t.hover);
+                        }
+                        ui.painter().text(
+                            r.left_center() + vec2(10.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            p.title,
+                            Tokens::ui(12.5),
+                            if sel { Color32::WHITE } else { t.text },
+                        );
+                        app.auto.add(&format!("settings.page.{}", p.id), r, p.title);
+                        if resp.clicked() {
+                            page = p.id.to_string();
+                        }
                     }
-                    ui.painter().text(
-                        r.left_center() + vec2(10.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        p.title,
-                        Tokens::ui(12.5),
-                        if sel { Color32::WHITE } else { t.text },
-                    );
-                    app.auto.add(&format!("settings.page.{}", p.id), r, p.title);
-                    if resp.clicked() {
-                        page = p.id.to_string();
-                    }
-                }
+                });
             });
             ui.separator();
             ui.vertical(|ui| {
@@ -417,6 +522,18 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 if let Some(f) = app.hooks.pick_open_project.as_ref().and_then(|f| f()) {
                     let _ = app.session.prefs.set(&k, json!(f));
                     app.session.prefs_changed();
+                }
+            }
+            Act::PickModel(task) => {
+                // The registry's file types for the task (`.pt`, `.task`).
+                let mut exts: Vec<&str> = effectcraft_engine::segment::models(task).filter_map(|m| m.file_name.rsplit_once('.').map(|x| x.1)).collect();
+                exts.dedup();
+                let picked = app.hooks.pick_files.as_ref().map(|f| f(&exts)).unwrap_or_default();
+                let cmd = if task == Task::Face { "face.model.install" } else { "roto.model.install" };
+                if let Some(path) = picked.into_iter().next()
+                    && let Err(e) = crate::menus::invoke(app, ctx, cmd, json!({"path": path}))
+                {
+                    app.ui.status = e;
                 }
             }
         }

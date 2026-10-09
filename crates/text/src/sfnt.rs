@@ -16,6 +16,9 @@ pub struct FaceNames {
     /// The family name in another language than English (CJK, Arabic… fonts), when the font
     /// has one (Settings ▸ Type ▸ Show Font Names in English off shows it).
     pub native_family: Option<String>,
+    /// The PostScript name (name id 6, e.g. `YuGothic-Bold`): what After Effects scripts and
+    /// `.aep`-derived data call a font.
+    pub postscript: Option<String>,
 }
 
 fn be16(b: &[u8], o: usize) -> Option<u16> {
@@ -79,6 +82,7 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     let style = get(17).or_else(|| get(2)).unwrap_or_else(|| "Regular".into());
     let full_name = get(4).unwrap_or_else(|| format!("{family} {style}"));
     let native_family = native_name(&nb, 16).or_else(|| native_name(&nb, 1)).filter(|n| *n != family);
+    let postscript = get(6).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let (mut weight, mut italic) = (400u16, false);
     if let Some((oo, ol)) = os2
         && let Some(ob) = read_at(r, oo, ol.min(78))
@@ -88,7 +92,7 @@ fn read_face<R: Read + Seek>(r: &mut R, off: u64, index: u32) -> Option<FaceName
     }
     let sl = style.to_ascii_lowercase();
     italic |= sl.contains("italic") || sl.contains("oblique");
-    Some(FaceNames { index, family, style, full_name, weight, italic, native_family })
+    Some(FaceNames { index, family, style, full_name, weight, italic, native_family, postscript })
 }
 
 /// A Windows Unicode name-table string by id in a language other than US English.
@@ -103,7 +107,7 @@ fn native_name(b: &[u8], id: u16) -> Option<String> {
             continue;
         }
         let raw = b.get(storage + off..storage + off + len)?;
-        let u: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         let s = String::from_utf16_lossy(&u);
         if !s.trim().is_empty() {
             return Some(s);
@@ -127,11 +131,11 @@ fn name_string(b: &[u8], id: u16) -> Option<String> {
         let raw = b.get(storage + off..storage + off + len)?;
         let (rank, s) = match plat {
             3 if enc == 1 || enc == 10 => {
-                let u: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                let u: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 (if lang == 0x409 { 0 } else { 1 }, String::from_utf16_lossy(&u))
             }
             0 => {
-                let u: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                let u: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                 (2, String::from_utf16_lossy(&u))
             }
             1 if enc == 0 => (3, raw.iter().map(|&c| if c < 128 { c as char } else { '?' }).collect()),

@@ -15,6 +15,7 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
+pub mod ease_presets;
 pub mod footage_check;
 pub mod guard;
 pub mod history;
@@ -26,6 +27,7 @@ pub mod mask_track;
 pub mod media_browser;
 pub mod media_cache;
 pub mod menus;
+pub mod models;
 pub mod offload;
 pub mod perf;
 pub mod prefs;
@@ -63,6 +65,7 @@ pub use effectcraft_keyframe as keyframe;
 pub use effectcraft_project as project;
 pub use effectcraft_raster as raster;
 pub use effectcraft_render as render;
+pub use effectcraft_segment as segment;
 pub use effectcraft_text as text;
 pub use effectcraft_time as time;
 pub use effectcraft_track as track;
@@ -79,6 +82,9 @@ pub enum EngineError {
     BadParams { cmd: String, msg: String },
     #[error("no active composition")]
     NoComp,
+    /// A `comp` reference (name or id) that names no composition.
+    #[error("no composition {0}")]
+    NoSuchComp(String),
     #[error("{0}")]
     Project(#[from] effectcraft_project::ProjectError),
     #[error("{0}")]
@@ -189,10 +195,17 @@ pub struct EditorState {
     /// selected layers.
     #[serde(skip)]
     pub effect_clipboard: Vec<effectcraft_project::PropGroup>,
+    /// Copied shape items (Edit ▸ Copy with groups, paths, paints or path operations selected in
+    /// a shape layer's Contents); Paste adds them to the selected shape layers.
+    #[serde(skip)]
+    pub contents_clipboard: Vec<effectcraft_project::PropGroup>,
     /// Selected mask vertices (viewer Selection tool / pen).
     #[serde(default)]
     pub selected_vertices: Vec<VertexRef>,
     pub snapping: bool,
+    /// Tools bar ▸ Snapping options (which features snap, Snap Edges Extended).
+    #[serde(default)]
+    pub snap_features: viewer::SnapFeatures,
     /// Last applied effect id (Effect ▸ last effect).
     pub last_effect: Option<String>,
     /// Viewer region of interest `[x, y, w, h]` in comp pixels (Composition ▸ Crop Comp to Region
@@ -229,6 +242,9 @@ pub struct EditorState {
     /// Puppet tool options for new meshes.
     #[serde(default)]
     pub puppet: commands::puppet::PuppetOptions,
+    /// The shape tools' and the Pen's options (Tool Creates Shape / Mask, Fill and Stroke).
+    #[serde(default)]
+    pub shape_tool: commands::shape_tool::ShapeTool,
     /// View ▸ Switch View Layout: 1, 2 or 4 views side by side in the Composition viewer.
     #[serde(default = "one_view")]
     pub view_layout: u8,
@@ -324,6 +340,9 @@ pub struct Session {
     /// that ask for [`effectcraft_render::Backend::Gpu`]/`Auto`, and by Render Queue exports
     /// when the project's renderer is the GPU.
     pub accel: Option<Arc<dyn effectcraft_render::Accelerator>>,
+    /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
+    /// headless start without `--gpu` or the compositor's setup error.
+    pub accel_note: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -347,6 +366,10 @@ pub struct Session {
     pub camera_pending: Vec<(ItemId, LayerId, Uid)>,
     /// The running (or finished, not yet polled) Roto Brush propagation / Freeze.
     pub roto_job: Option<roto::RotoJob>,
+    /// Trained models for Roto Brush and face tracking (Settings ▸ Roto Brush / Face Tracking).
+    pub models: models::Models,
+    /// Where installed models live (hosts set it; else `models` next to the settings).
+    pub models_dir: Option<std::path::PathBuf>,
     /// Roto Brush instances edited since their last propagation: (comp, layer, effect uid).
     pub roto_pending: Vec<(ItemId, LayerId, Uid)>,
     pub events: Vec<Event>,
@@ -365,12 +388,17 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
+    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
+    pub ease_presets: Vec<ease_presets::EasePreset>,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
     pub shortcut_table: std::sync::OnceLock<shortcuts::ShortcutTable>,
     /// Auto-save bookkeeping.
     pub autosave: autosave::AutoSaveState,
+    /// Host-owned isolation for all auto-saves (e.g. one MCP session). Independent of settings
+    /// and project bookkeeping, so opening/saving a project or changing preferences keeps it.
+    pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
@@ -451,6 +479,7 @@ impl Default for Session {
             footage: Arc::new(NoFootage),
             expr: None,
             accel: None,
+            accel_note: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -463,6 +492,8 @@ impl Default for Session {
             camera_job: None,
             camera_pending: vec![],
             roto_job: None,
+            models: Default::default(),
+            models_dir: None,
             roto_pending: vec![],
             events: vec![],
             journal: vec![],
@@ -472,9 +503,11 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
+            ease_presets: vec![],
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
+            autosave_folder_override: None,
             snapshot: None,
             script: None,
             plugin_loader: None,
@@ -942,6 +975,8 @@ mod tests_color_view;
 #[cfg(test)]
 mod tests_disk_cache;
 #[cfg(test)]
+mod tests_ease_presets;
+#[cfg(test)]
 mod tests_effects;
 #[cfg(test)]
 mod tests_essential;
@@ -953,6 +988,8 @@ mod tests_face;
 mod tests_fidelity;
 #[cfg(test)]
 mod tests_frame_export;
+#[cfg(test)]
+mod tests_keylight;
 #[cfg(test)]
 mod tests_lottie;
 #[cfg(test)]
@@ -967,6 +1004,8 @@ mod tests_mask_warp;
 mod tests_menu_cmds;
 #[cfg(test)]
 mod tests_model3d;
+#[cfg(test)]
+mod tests_motion_blur_depth;
 #[cfg(test)]
 mod tests_project_items;
 #[cfg(test)]
@@ -1004,6 +1043,17 @@ pub fn text_presets() -> Vec<(String, String)> {
 
 pub fn text_families() -> Vec<String> {
     effectcraft_text::families().into_iter().map(|(f, _)| f).collect()
+}
+
+/// The styles a family offers (its own faces, in weight order), for the style menus. A family
+/// that isn't installed offers the usual styles, which resolve to Inter's.
+pub fn font_styles(family: &str) -> Vec<String> {
+    effectcraft_text::families()
+        .into_iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(family))
+        .map(|(_, st)| st)
+        .filter(|st| !st.is_empty())
+        .unwrap_or_else(|| ["Regular", "Medium", "SemiBold", "Bold", "Italic"].iter().map(|s| s.to_string()).collect())
 }
 
 /// The OpenType feature tags (GSUB / GPOS) of the face a family + style resolves to.
@@ -1074,6 +1124,8 @@ pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
 }
 #[cfg(test)]
 mod tests_history;
+#[cfg(test)]
+mod tests_models;
 #[cfg(test)]
 mod tests_paint;
 #[cfg(test)]

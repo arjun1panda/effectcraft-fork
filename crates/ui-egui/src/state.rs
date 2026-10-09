@@ -303,6 +303,8 @@ pub struct ViewerState {
     /// The pointer is dragging in the viewer this frame (Adaptive Resolution).
     #[serde(skip)]
     pub interacting: bool,
+    #[serde(skip)]
+    pub property_interacting: bool,
     /// Extended Viewer: the comp-space region the viewer renders this frame (comp frame plus
     /// the visible pasteboard), set while a 3D view shows past the frame.
     #[serde(skip)]
@@ -334,10 +336,28 @@ impl Default for ViewerState {
             ruler_origin: [0.0, 0.0],
             roi_draw: false,
             interacting: false,
+            property_interacting: false,
             extended: None,
             pasteboard: None,
             custom_pasteboard: [0x80, 0x80, 0x80],
         }
+    }
+}
+
+impl TimelineState {
+    /// Show `kinds` on `layers` (twirled open; empty: twirled closed) and remember it as the last
+    /// reveal. Other layers keep theirs.
+    pub fn apply_reveal(&mut self, layers: &[u64], kinds: Vec<String>) {
+        for id in layers {
+            if kinds.is_empty() {
+                self.open_layers.remove(id);
+                self.layer_reveal.remove(id);
+            } else {
+                self.open_layers.insert(*id);
+                self.layer_reveal.insert(*id, kinds.clone());
+            }
+        }
+        self.reveal = kinds;
     }
 }
 
@@ -358,13 +378,19 @@ pub struct TimelineState {
     /// Twirled-open layers and groups (by layer id / group uid).
     pub open_layers: BTreeSet<u64>,
     pub open_groups: BTreeSet<u64>,
-    /// "Reveal" filter: only show these property match ids (P/S/R/T/A…) — empty = normal.
+    /// The last reveal shortcut's filter (P/S/R/T/A…): what pressing it again toggles or adds to.
     pub reveal: Vec<String>,
+    /// Each revealed layer's filter: an open layer without one shows its whole property tree. A
+    /// reveal shortcut sets it on the selected layers (all layers with none selected) and leaves
+    /// the others as they are.
+    #[serde(default)]
+    pub layer_reveal: BTreeMap<u64, Vec<String>>,
     /// Properties / groups (uids) shown by the `props` reveal (Animation ▸ Reveal Properties…).
     #[serde(default)]
     pub reveal_props: BTreeSet<u64>,
-    /// Graph Editor: `value` or `speed` graph.
-    #[serde(default = "value_graph")]
+    /// Graph Editor: `auto` (Auto-Select Graph Type, the default: the speed graph when every
+    /// property shown is spatial, else the value graph), `value` or `speed`.
+    #[serde(default = "auto_graph")]
     pub graph_mode: String,
     /// Show only the selected properties (else every animated property of the selected layers).
     #[serde(default = "yes")]
@@ -387,6 +413,10 @@ pub struct TimelineState {
     /// Properties whose inline expression editor is collapsed.
     #[serde(default)]
     pub expr_closed: BTreeSet<u64>,
+    /// Scale and Mask Feather properties whose chain link (Constrain Proportions, on by default)
+    /// was turned off.
+    #[serde(default)]
+    pub unlinked: BTreeSet<u64>,
     /// Visible optional columns (column header right-click ▸ Columns): `av`, `keys`, `label`,
     /// `num`, `comment`, `switches`, `parent`, `in`, `out`, `duration`, `stretch`. The name
     /// column is always shown; Modes follows `show_modes` (F4).
@@ -401,8 +431,8 @@ pub fn default_tl_columns() -> BTreeSet<String> {
     ["av", "label", "num", "switches", "parent"].map(String::from).into_iter().collect()
 }
 
-fn value_graph() -> String {
-    "value".into()
+fn auto_graph() -> String {
+    "auto".into()
 }
 fn yes() -> bool {
     true
@@ -422,8 +452,9 @@ impl Default for TimelineState {
             open_layers: BTreeSet::new(),
             open_groups: BTreeSet::new(),
             reveal: vec![],
+            layer_reveal: BTreeMap::new(),
             reveal_props: BTreeSet::new(),
-            graph_mode: value_graph(),
+            graph_mode: auto_graph(),
             graph_show_selected: true,
             graph_auto_zoom: true,
             graph_range: None,
@@ -431,6 +462,7 @@ impl Default for TimelineState {
             graph_reference: false,
             graph_transform_box: true,
             expr_closed: BTreeSet::new(),
+            unlinked: BTreeSet::new(),
             columns: default_tl_columns(),
             source_name: false,
         }
@@ -541,6 +573,13 @@ pub struct UiState {
     /// bring a locked panel forward (the tab's lock icon, as After Effects' viewer lock).
     #[serde(default)]
     pub locked_tabs: BTreeSet<String>,
+    /// The comp each Composition viewer shows, by viewer id (0 = the Composition panel; see
+    /// `panels::viewers`).
+    #[serde(default)]
+    pub viewers: std::collections::BTreeMap<u32, Option<u64>>,
+    /// The active viewer (the interactive one, showing the active comp).
+    #[serde(default)]
+    pub active_viewer: u32,
     pub focused: PanelKind,
     pub viewer: ViewerState,
     pub timeline: TimelineState,
@@ -594,13 +633,7 @@ pub struct UiState {
     /// Effects & Presets contents-menu view options.
     #[serde(default)]
     pub effects_view: EffectsView,
-    /// Shape tool options.
-    pub fill_color: [f32; 3],
-    pub stroke_color: [f32; 3],
-    pub stroke_width: f32,
     pub snapping: bool,
-    /// Tool creates shape (true) or mask (false) when a layer is selected.
-    pub tool_creates_shape: bool,
     pub start_screen: bool,
     /// The Home screen shows its Learn tab (tutorials) instead of the recent projects.
     #[serde(default)]
@@ -634,6 +667,9 @@ pub struct UiState {
     /// Lumetri Scopes panel options.
     #[serde(default)]
     pub scopes: crate::panels::scopes_panel::ScopesState,
+    /// Ease Presets panel: working curve, selected preset, name field.
+    #[serde(default)]
+    pub ease_presets: crate::panels::ease_presets::EasePanelState,
 }
 
 impl Default for UiState {
@@ -649,6 +685,8 @@ impl Default for UiState {
             saved_floating: Default::default(),
             maximized: None,
             locked_tabs: BTreeSet::new(),
+            viewers: Default::default(),
+            active_viewer: 0,
             focused: PanelKind::Composition,
             viewer: ViewerState::default(),
             timeline: TimelineState::default(),
@@ -673,11 +711,7 @@ impl Default for UiState {
             effects_favorites: BTreeSet::new(),
             effects_recent: Vec::new(),
             effects_view: EffectsView::default(),
-            fill_color: [0.24, 0.55, 0.96],
-            stroke_color: [1.0, 1.0, 1.0],
-            stroke_width: 0.0,
             snapping: true,
-            tool_creates_shape: true,
             start_screen: false,
             home_learn: false,
             home_templates: false,
@@ -690,6 +724,7 @@ impl Default for UiState {
             mini_flowchart: None,
             flowchart: Default::default(),
             scopes: Default::default(),
+            ease_presets: Default::default(),
         }
     }
 }

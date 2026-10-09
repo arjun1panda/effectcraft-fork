@@ -778,8 +778,9 @@ pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
 }
 
 /// Content key of a composition's pixels: project render settings, the comp and everything it
-/// uses (nested comps, footage, solids, footage files' size and time). With expressions in play
-/// (which can read any comp) the whole project counts.
+/// uses (nested comps, footage, solids, their proxies and Use Proxy switches, footage and proxy
+/// files' size and time). With expressions in play (which can read any comp) the whole project
+/// counts. Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't count.
 pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId) -> u128 {
     use effectcraft_project::{ItemKind, LayerSource};
     let mut h = Hash128::default();
@@ -809,9 +810,16 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
         let Some(it) = project.item(id) else { continue };
         h.write_u64(id.0);
         h.write(it.name.as_bytes());
-        hash_debug(&mut h, &it.kind);
+        match &it.kind {
+            ItemKind::Comp(c) => hash_debug(&mut h, &c.pixel_form()),
+            k => hash_debug(&mut h, k),
+        }
         if let ItemKind::Footage(f) = &it.kind {
             footage_stamp(&mut h, f);
+        }
+        hash_debug(&mut h, &it.proxy);
+        if let Some(px) = &it.proxy {
+            footage_stamp(&mut h, &px.footage);
         }
     }
     h.write_u64(comp.0);

@@ -22,6 +22,25 @@ pub const PREFS_VERSION: u32 = 2;
 /// Settings file name in the config store.
 pub const PREFS_FILE: &str = "prefs.json";
 
+/// Settings ▸ General ▸ Language: (label, `general.language` value).
+pub const LANGUAGES: &[(&str, &str)] = &[("Match System", "system"), ("English", "en"), ("日本語", "ja"), ("简体中文", "zh-hans"), ("繁體中文", "zh-hant")];
+
+/// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
+pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
+
+/// The settings whose value must be one of their choices.
+fn choices(key: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    match key {
+        "general.language" => Some(LANGUAGES),
+        "startup.windowGraphics" => Some(WINDOW_GRAPHICS),
+        _ => None,
+    }
+}
+
+fn is_choice(choices: &[(&str, &str)], v: &str) -> bool {
+    choices.iter().any(|(_, c)| *c == v)
+}
+
 /// Unknown keys inside a page, kept so a newer version's settings survive a round trip.
 type Extra = BTreeMap<String, Value>;
 
@@ -44,6 +63,9 @@ macro_rules! page {
 }
 
 page!(General {
+    /// Interface language: `system` (the operating system's, where EffectCraft has it, else
+    /// English), `en` or `ja`.
+    language: String = "system".into(),
     /// Levels of Undo (1–99).
     undo_levels: u32 = 32,
     /// Path Point and Handle Size (px).
@@ -69,6 +91,10 @@ page!(Startup {
     show_home_on_open_project: bool = false,
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
+    /// What the desktop window draws with, from the next launch: `auto` (the platform's best
+    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch whose
+    /// window never drew switches it to `gl` (#243).
+    window_graphics: String = "auto".into(),
 });
 
 page!(ProjectPrefs {
@@ -209,6 +235,24 @@ page!(ThreeD {
     realtime_shadows: bool = true,
 });
 
+page!(
+    /// Settings ▸ Roto Brush.
+    RotoPrefs {
+        /// The segmentation model Roto Brush 2.0 / 3.0 use: `classical` (built in) or a model id
+        /// from `effectcraft_segment::MODELS` (once installed).
+        model: String = "classical".into(),
+    }
+);
+
+page!(
+    /// Settings ▸ Face Tracking.
+    FacePrefs {
+        /// The model Track Mask ▸ Face Tracking uses: `classical` (built in) or a model id from
+        /// `effectcraft_segment::MODELS` (once installed).
+        model: String = "classical".into(),
+    }
+);
+
 page!(Scripting {
     allow_scripts_write_files: bool = false,
     warn_executing_files: bool = true,
@@ -242,7 +286,7 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
     if h.len() != 6 {
         return None;
     }
-    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    let p = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
     Some([p(0)?, p(2)?, p(4)?])
 }
 
@@ -272,6 +316,8 @@ pub struct Prefs {
     #[serde(rename = "threeD")]
     pub three_d: ThreeD,
     pub scripting: Scripting,
+    pub roto: RotoPrefs,
+    pub face: FacePrefs,
     /// File ▸ Open Recent, newest first.
     pub recent_projects: Vec<String>,
     /// File ▸ Import Recent Footage, newest first.
@@ -312,6 +358,8 @@ impl Default for Prefs {
             video: Video::default(),
             three_d: ThreeD::default(),
             scripting: Scripting::default(),
+            roto: RotoPrefs::default(),
+            face: FacePrefs::default(),
             recent_projects: vec![],
             recent_footage: vec![],
             recent_presets: vec![],
@@ -392,7 +440,13 @@ impl Prefs {
     /// Clamp values into their valid ranges and fill missing labels.
     pub fn normalize(&mut self) {
         self.version = PREFS_VERSION;
+        if !is_choice(WINDOW_GRAPHICS, &self.startup.window_graphics) {
+            self.startup.window_graphics = Startup::default().window_graphics;
+        }
         let g = &mut self.general;
+        if !is_choice(LANGUAGES, &g.language) {
+            g.language = General::default().language;
+        }
         g.undo_levels = g.undo_levels.clamp(1, 99);
         g.path_point_size = g.path_point_size.clamp(3, 20);
         g.recent_items = g.recent_items.clamp(1, 30);
@@ -431,6 +485,12 @@ impl Prefs {
 
     /// Set the value at a dotted key. The key must exist and the value must have its type.
     pub fn set(&mut self, key: &str, value: Value) -> Result<(), String> {
+        if let Some(c) = choices(key)
+            && !value.as_str().is_some_and(|v| is_choice(c, v))
+        {
+            let all: Vec<&str> = c.iter().map(|(_, v)| *v).collect();
+            return Err(format!("`{key}` expects one of {}", all.join(", ")));
+        }
         let mut v = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
         let ptr = format!("/{}", key.replace('.', "/"));
         let slot = v.pointer_mut(&ptr).ok_or_else(|| format!("unknown setting `{key}`"))?;
@@ -709,6 +769,8 @@ pub fn section_key(page: &str) -> Option<&'static str> {
         "video" => "video",
         "3d" | "threeD" => "threeD",
         "scripting" => "scripting",
+        "roto" => "roto",
+        "face" => "face",
         _ => return None,
     })
 }
@@ -735,6 +797,8 @@ pub fn page_id(name: &str) -> Option<&'static str> {
         "video" | "videopreview" => "video",
         "3d" | "threed" => "3d",
         "scripting" | "scriptingexpressions" => "scripting",
+        "roto" | "rotobrush" | "models" => "roto",
+        "face" | "facetracking" => "face",
         _ => return None,
     };
     Some(id)
@@ -822,6 +886,9 @@ pub enum Item {
     /// The browser's storage manager (web app only, `storage.*`): usage and quota, persistent
     /// storage, Clear buttons. Not shown where there is no browser storage.
     BrowserStorage,
+    /// A task's trained models (`roto.models`, `face.models`): authors, licence, size, install,
+    /// choose.
+    Models(effectcraft_segment::Task),
 }
 
 /// One page of the Settings dialog.
@@ -848,6 +915,7 @@ pub fn pages() -> Vec<Page> {
             id: "general",
             title: "General",
             items: vec![
+                s("general.language", "Language", Kind::Choice(LANGUAGES), true),
                 s("general.undoLevels", "Levels of Undo", Kind::Int(1, 99, ""), true),
                 s("general.pathPointSize", "Path Point and Handle Size", Kind::Int(3, 20, "px"), true),
                 s("general.recentItems", "Recent Projects Shown", Kind::Int(1, 30, ""), true),
@@ -871,6 +939,10 @@ pub fn pages() -> Vec<Page> {
                 s("startup.showHomeOnLaunch", "Show Home Screen When Launching", B, true),
                 s("startup.showHomeOnOpenProject", "Show Home Screen When Opening a Project", B, true),
                 s("startup.offerCrashRecovery", "Offer to Open the Latest Auto-Save After a Crash", B, true),
+                s("startup.windowGraphics", "Window Graphics", Kind::Choice(WINDOW_GRAPHICS), true),
+                Note(
+                    "Window Graphics applies from the next launch. When the graphics driver stops EffectCraft before its window draws, the next launch switches to OpenGL.",
+                ),
                 Section("Repair"),
                 Button { label: "Reset Settings", command: "prefs.reset", params: "{}" },
                 Button { label: "Reset Keyboard Shortcuts", command: "shortcuts.reset", params: "{}" },
@@ -1096,6 +1168,28 @@ pub fn pages() -> Vec<Page> {
                 Note("Expressions use the JavaScript engine. Script errors report their file and line in the Script Console; there is no step debugger."),
             ],
         },
+        Page {
+            id: "roto",
+            title: "Roto Brush",
+            items: vec![
+                Section("Segmentation Model"),
+                Note(
+                    "Roto Brush 2.0 and 3.0 use the model chosen here (Version 1.0 always uses the classic engine). Models are open source, downloaded only when you ask, and checked against their published SHA-256.",
+                ),
+                Models(effectcraft_segment::Task::Mask),
+            ],
+        },
+        Page {
+            id: "face",
+            title: "Face Tracking",
+            items: vec![
+                Section("Face Model"),
+                Note(
+                    "Face tracking in the Tracker panel (Outline Only and Detailed Features) uses the model chosen here. Models are open source, downloaded only when you ask, and checked against their published SHA-256.",
+                ),
+                Models(effectcraft_segment::Task::Face),
+            ],
+        },
     ]
 }
 
@@ -1148,6 +1242,10 @@ pub fn pages_json() -> Value {
                     Item::AudioDevices { key } => json!({"type": "device", "key": key, "label": "Default Output"}),
                     Item::Note(t) => json!({"note": t}),
                     Item::BrowserStorage => json!({"browserStorage": "storage.info / storage.persist / storage.clear (web app)"}),
+                    Item::Models(task) => {
+                        let p = if *task == effectcraft_segment::Task::Face { "face" } else { "roto" };
+                        json!({"models": format!("{p}.models / {p}.model.select / {p}.model.download / {p}.model.install / {p}.model.remove"), "key": format!("{p}.model")})
+                    }
                 })
                 .collect();
             json!({"id": p.id, "title": p.title, "items": items})

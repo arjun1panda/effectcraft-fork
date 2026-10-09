@@ -30,6 +30,7 @@ fn project(s: &mut Session) -> effectcraft_project::ItemId {
 
 #[test]
 fn disk_cache_settings_persistence_and_invalidation() {
+    crate::tests_roto::hold_roto_cache_test_lock();
     let dir = folder("persist");
     let mut s = session(&dir);
     let st = s.execute_checked("cache.diskStats", json!({})).unwrap();
@@ -116,7 +117,22 @@ fn footage_changes_change_the_salt() {
     s.execute("prop.set", json!({"layer": "#1", "path": "transform/opacity", "value": 50})).unwrap();
     let k2 = effectcraft_render::disk_cache::comp_content_key(&s.project, cid);
     assert_ne!(k1, k2);
+    // Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't change it (#103).
+    for sw in ["audio", "lock", "shy"] {
+        s.execute("layer.setSwitch", json!({"layers": ["#1"], "switch": sw, "value": sw != "audio"})).unwrap();
+    }
+    s.execute("comp.setSwitch", json!({"switch": "hideShy", "value": true})).unwrap();
+    assert_eq!(effectcraft_render::disk_cache::comp_content_key(&s.project, cid), k2);
     // Unrelated comps do not change it.
     s.execute("comp.new", json!({"name": "Other", "width": 10, "height": 10, "frameRate": 30, "duration": 1})).unwrap();
     assert_eq!(effectcraft_render::disk_cache::comp_content_key(&s.project, cid), k2);
+    // A proxy, and its Use Proxy switch, change the pixels.
+    let set_proxy = |s: &mut Session, enabled: bool| {
+        let it = std::sync::Arc::make_mut(&mut s.project).items.get_mut(&cid).unwrap();
+        it.proxy = Some(Box::new(effectcraft_project::Proxy { footage: effectcraft_project::Footage::default(), enabled }));
+        effectcraft_render::disk_cache::comp_content_key(&s.project, cid)
+    };
+    let k3 = set_proxy(&mut s, true);
+    assert_ne!(k3, k2);
+    assert_ne!(set_proxy(&mut s, false), k3);
 }

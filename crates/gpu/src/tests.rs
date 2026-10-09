@@ -26,17 +26,56 @@ use effectcraft_time::{FrameRate, Tick};
 
 use crate::Gpu;
 
+/// One GPU test at a time in this process: the calling test thread holds a process-wide lock
+/// until it exits (libtest runs every test on a thread of its own). wgpu's OpenGL backend (Mesa
+/// llvmpipe on FreeBSD, Linux without Vulkan) has one context lock per adapter and panics when a
+/// thread waits on it for more than a few seconds ("Could not lock adapter context"), and
+/// concurrent devices on llvmpipe can crash. Every test helper that hands out a device calls this
+/// first; calling it again on the same thread is a no-op.
+pub(crate) fn hold_gpu_lock() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+    static GPU_LOCK: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.is_none() {
+            *h = Some(GPU_LOCK.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
+}
+
+/// The shared test device (the calling test holds [`hold_gpu_lock`]).
 pub(crate) fn gpu() -> Option<&'static Gpu> {
     static G: OnceLock<Option<Gpu>> = OnceLock::new();
+    hold_gpu_lock();
     G.get_or_init(|| {
         let g = Gpu::headless();
         if g.is_none() {
             eprintln!("effectcraft-gpu tests: no GPU adapter, skipping GPU comparisons");
+        } else if let Some(g) = &g {
+            eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name);
         }
         g
     })
     .as_ref()
 }
+
+/// The test device is on wgpu's OpenGL backend (Mesa's llvmpipe on the FreeBSD CI job).
+pub(crate) fn on_gl() -> bool {
+    gpu().is_some_and(|g| g.ctx.name.ends_with("(Gl)"))
+}
+
+/// On GL, the fraction of pixels allowed past the tolerance: pixels on a decision boundary (a
+/// hex cell's edge, a threshold, a corner pin's coverage edge, a median's rank tie) may land on
+/// the other side, since GL drivers may divide through a reciprocal and GLSL's `fma` need not be
+/// fused (so `fxs_qdiv`-style corrections don't apply). Measured on llvmpipe: at most 0.53 % (CC
+/// HexTile at half resolution, many cell edges in a small frame). A wrong wrap (signed `%`) showed
+/// in 3–70 % of pixels and still fails; a precision loss may show in fewer (Mesa's `asin`: 0.3–3 %),
+/// so the shaders avoid imprecise builtins themselves (`asin_p`) rather than lean on this.
+pub(crate) const GL_BOUNDARY_FLIPS: f64 = 0.01;
 
 /// Procedural footage: smooth colour gradients, fine noise and an alpha with soft, opaque and
 /// fully transparent regions (different per item).
@@ -205,6 +244,7 @@ pub(crate) fn check(label: &str, d: Option<Diff>, allow: f64) {
     let frac = d.over as f64 / d.total as f64;
     // Quantised depths: rounding-boundary flips (see the module docs).
     let (allow, cap) = if d.quantized && allow == 0.0 { (0.003, 4.0 / 255.0 + 1e-6) } else { (allow, f32::INFINITY) };
+    let (allow, cap) = if on_gl() { (allow.max(GL_BOUNDARY_FLIPS), f32::INFINITY) } else { (allow, cap) };
     assert!(frac <= allow && d.max <= cap, "{label}: {} of {} pixels over tolerance (max {:.6}); worst {:?}", d.over, d.total, d.max, d.worst);
     if d.over > 0 {
         eprintln!("{label}: {} of {} pixels over tolerance (max {:.6})", d.over, d.total, d.max);
@@ -403,7 +443,15 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
         let d = diff(&cpu.img, &out.img, 1e-3);
-        assert!(d.over == 0, "{id} {vals:?} adj {adjustment} scale {scale}: {} of {} pixels over 1e-3 (max {}); worst {:?}", d.over, d.total, d.max, d.worst);
+        let allow = if on_gl() { (d.total as f64 * GL_BOUNDARY_FLIPS) as usize } else { 0 };
+        assert!(
+            d.over <= allow,
+            "{id} {vals:?} adj {adjustment} scale {scale}: {} of {} pixels over 1e-3 (max {}); worst {:?}",
+            d.over,
+            d.total,
+            d.max,
+            d.worst
+        );
     }
 }
 
@@ -535,6 +583,30 @@ fn registry_badges_match_the_gpu_implementation() {
 }
 
 #[test]
+fn quantization_preserves_cpu_levels_and_half_step_neighbors() {
+    let Some(g) = gpu() else { return };
+    for levels in [255.0_f32, 32768.0] {
+        let mut values = vec![0.0, 1.0];
+        for i in 0..255 {
+            let half = (i as f32 + 0.5) / levels;
+            values.extend([half.next_down(), half, half.next_up()]);
+        }
+        let mut cpu = Image::new(values.len() as u32, 1);
+        for (p, v) in cpu.data.iter_mut().zip(values) {
+            *p = [v, v, v, 1.0];
+        }
+        let input = g.ctx.upload_image(&cpu).unwrap();
+        effectcraft_render::color::quantize(&mut cpu, levels);
+        let mut e = crate::context::Enc::new(&g.ctx);
+        let out = crate::ops::quantize(&mut e, &input, levels);
+        let bytes = e.read_texture(&out.texture, out.width, out.height, 16).unwrap();
+        for (i, (want, got)) in cpu.data.iter().flatten().zip(bytes.as_chunks::<4>().0).enumerate() {
+            let actual = f32::from_le_bytes(*got);
+            assert_eq!(actual, *want, "levels {levels}, component {i}");
+        }
+    }
+}
+#[test]
 fn backend_selection_and_display_frames() {
     let Some(g) = gpu() else { return };
     let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
@@ -554,7 +626,7 @@ fn backend_selection_and_display_frames() {
     let f = g.render_display(&r, s.cid, Tick::ZERO).expect("display frame");
     let bytes = g.read_display(&f).expect("readback");
     let cpu = Renderer::new(&s.p, &Pattern, opts()).comp_frame_cpu(s.cid, Tick::ZERO);
-    for (p, q) in cpu.data.iter().zip(bytes.chunks_exact(4)) {
+    for (p, q) in cpu.data.iter().zip(bytes.as_chunks::<4>().0.iter()) {
         let a = p[3].clamp(0.0, 1.0);
         let want = [p[0].clamp(0.0, a), p[1].clamp(0.0, a), p[2].clamp(0.0, a), a].map(|v| (v * 255.0 + 0.5) as u8);
         for k in 0..4 {
@@ -603,4 +675,27 @@ fn wgsl_float_literals_fit_f32() {
         }
     }
     assert!(checked > 0);
+}
+
+/// A device created with WebGL2's limits (what egui-wgpu asks for on GL, as the desktop app on
+/// FreeBSD gets): the compositor declines it instead of building pipelines that fail validation
+/// (wgpu's default error handler panics here; release builds would only log it).
+#[test]
+fn devices_with_webgl2_limits_are_declined() {
+    hold_gpu_lock();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let desc = wgpu::DeviceDescriptor { required_limits: wgpu::Limits::downlevel_webgl2_defaults(), ..Default::default() };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
+    let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
+    // A GL adapter (FreeBSD's llvmpipe) is declined for its backend before its limits are checked.
+    assert!(err.contains("max_storage_buffers_per_shader_stage") || err.contains("(Gl)"), "{err}");
+}
+
+/// GPU work inside the video memory guard returns its result when the device has room (#106).
+#[test]
+fn within_memory_returns_the_work_when_there_is_room() {
+    let Some(g) = gpu() else { return };
+    let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
+    assert_eq!((img.width, img.height), (64, 32));
 }

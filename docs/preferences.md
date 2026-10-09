@@ -29,6 +29,7 @@ Commands (CLI, MCP, control channel):
 
 ### Settings that change behaviour
 
+- `general.language`: interface language (`system` / `en` / `ja` / `zh-hans` / `zh-hant`), Settings ▸ General ▸ Language; menu labels change immediately. `system` (Match System, the default) follows the operating system's interface language where EffectCraft has a translation and is English otherwise: a Simplified Chinese locale (`zh`, `zh-CN`, `zh_CN.UTF-8`, `zh-Hans-CN`, `zh-SG`) selects `zh-hans`, a Traditional one (`zh-TW`, `zh-HK`, `zh-Hant`, `zh_MO`) selects `zh-hant`; the browser build stays in English with it. Native Japanese, Simplified and Traditional Chinese UI uses installed system fonts; the web host must supply a Japanese font.
 - `general.undoLevels`: Levels of Undo
 - `general.pathPointSize`: Path Point and Handle Size
 - `general.recentItems`: Recent Projects Shown
@@ -37,6 +38,7 @@ Commands (CLI, MCP, control channel):
 - `general.defaultSpatialLinear`: Default Spatial Interpolation to Linear
 - `startup.showHomeOnLaunch`: Show Home Screen When Launching
 - `startup.offerCrashRecovery`: Offer to Open the Latest Auto-Save After a Crash
+- `startup.windowGraphics`: Window Graphics (`auto` / `gl`), what the desktop window draws with from the next launch. `auto` lets the platform pick (DirectX 12, Vulkan or Metal); `gl` uses OpenGL, with CPU compositing, for graphics drivers that crash with the others. A launch whose window never drew leaves a `launch-pending` marker in the settings folder, and the next launch switches to `gl` and says so (not on macOS, which has no OpenGL backend). `WGPU_BACKEND` overrides both.
 - `project.useTemplate`: New Project Loads Template
 - `project.templatePath`: Template Project
 - `autoSave.enabled`: Automatically Save Projects
@@ -139,6 +141,13 @@ Commands (CLI, MCP, control channel):
   the Timeline's expression editor
 - `scripting.errorBanner`: a banner along the bottom of the Composition panel names the first
   failing expression (click: reveal it)
+- `roto.model` (Settings ▸ Roto Brush): the segmentation model Roto Brush 2.0 / 3.0 use,
+  `classical` (built in) or `mobilesam` (once installed). The page lists every registered model
+  with its authors, licence, size, source and status, with Download, Install from File… and
+  Remove (`roto.models` / `roto.model.*`); weights live in the `models` folder next to the
+  settings, each with a `.NOTICE.txt` naming its authors and licence
+- `face.model` (Settings ▸ Face Tracking): the model face tracking uses, `classical` (built in) or
+  `mediapipe-face` (once installed); the same page of models (`face.models` / `face.model.*`)
 
 ### Display-only settings
 
@@ -180,7 +189,7 @@ from?, newName?}`, `shortcuts.export {preset?, path?}`, `shortcuts.import {path?
 - Every *n* minutes (Settings ▸ Project ▸ Auto-Save) a project with unsaved changes is written
   to an `EffectCraft Auto-Save` folder next to it (or the custom folder) as
   `<name> auto-save N.ecproj`. Slots rotate through 1…maximum versions, overwriting the oldest.
-  Untitled projects go to the custom folder, or to `Auto-Save` in the config directory.
+  Untitled projects go to the custom folder, or to `EffectCraft Auto-Save` in the config directory.
 - Every project and auto-save write is atomic: a temporary file is written and flushed, then
   renamed over the target, so a crash mid-write leaves the previous file intact.
 - While the app runs, `session.lock` in the config directory records the open project and its
@@ -188,6 +197,13 @@ from?, newName?}`, `shortcuts.export {preset?, path?}`, `shortcuts.import {path?
   offers to open the latest auto-save (Settings ▸ Startup & Repair can turn this off).
 - File ▸ Open Recent lists recent projects (stored in the settings), File ▸ Revert reloads the
   saved project, File ▸ Increment and Save saves `Intro.ecproj` as `Intro 2.ecproj`.
+
+Headless MCP clients can opt in with `effectcraft-cli mcp --autosave`. Unlike the desktop's
+interval, this writes changed dirty projects before sending each tool reply, with separate
+version slots per server under `EffectCraft Auto-Save/MCP/` (or the custom folder's `MCP/`).
+It reads settings without sharing the desktop's writable settings store or `session.lock`.
+See [headless recovery](agents.md#keeping-headless-work-across-restarts) for how to reopen a
+checkpoint after a client restart.
 
 Commands: `file.autoSave` (now), `file.recoveryInfo`, `file.openRecent {index? | path?}`,
 `file.clearRecent`, `file.revert`, `file.incrementAndSave`.

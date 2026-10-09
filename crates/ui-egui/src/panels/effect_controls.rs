@@ -39,6 +39,27 @@ fn selected_layer(app: &EffectcraftApp) -> Option<Layer> {
     comp.layer(*id).cloned()
 }
 
+/// An effect was just applied (`effect.apply` / `effect.applyLast` with `params`): Effect
+/// Controls comes up (opened if closed, brought to the front, the focus left where it is) on the
+/// layer the effect went to, with the new effect selected, as in After Effects.
+pub fn reveal_applied(app: &mut EffectcraftApp, params: &serde_json::Value) {
+    // `effect.apply` selects the new effect on (the last of) the layers it went to.
+    let target = app.session.state.selected_props.last().map(|(l, _)| *l);
+    if let Some(l) = target
+        && !app.session.state.selected_layers.contains(&l)
+        && params.get("comp").is_none()
+        && app.session.active_comp().is_some_and(|c| c.layer(l).is_some())
+    {
+        // Show that layer (dropped on an unselected one), keeping the new effect selected.
+        let props = app.session.state.selected_props.clone();
+        match app.session.execute("layer.select", json!({"layers": [l.0]})) {
+            Ok(_) => app.session.state.selected_props = props,
+            Err(e) => app.ui.status = e.to_string(),
+        }
+    }
+    app.raise_panel(crate::dock::PanelKind::EffectControls);
+}
+
 /// An undo-merge key for one gesture on `id`: a new key each time a drag starts, so separate
 /// drags are separate undo steps while one drag is one step.
 pub(super) fn gesture_key(ui: &egui::Ui, id: egui::Id, started: bool) -> String {
@@ -161,10 +182,27 @@ fn prop_row(
     if prop.is_animated() {
         key_navigator(app, ui, p, layer, prop, ectx, r, actions);
     }
-    let name_clip = Rect::from_min_max(pos2(swr.max.x + 6.0, r.min.y), pos2((r.min.x + r.width() * 0.48).max(swr.max.x + 124.0) - 4.0, r.max.y));
-    p.with_clip_rect(name_clip.intersect(p.clip_rect())).text(pos2(swr.max.x + 6.0, cy), Align2::LEFT_CENTER, &prop.name, Tokens::ui(12.0), t.text);
-    let vx = (r.min.x + r.width() * 0.48).max(swr.max.x + 130.0);
     let value = ectx.value(layer, prop);
+    let vx = (r.min.x + r.width() * 0.48).max(swr.max.x + 130.0);
+    // A vector's values end before the keyframe navigator: in a narrow panel they move left over
+    // the name (cut short) instead of running under the navigator (#271).
+    let vx = match &value {
+        Value::Vec2(_) | Value::Vec3(_) => {
+            let point = if matches!(prop.ui, ParamUi::Point | ParamUi::Point3) { 22.0 } else { 0.0 };
+            let fields: f32 = value
+                .components()
+                .iter()
+                .take(shown_dims(layer, prop, &value))
+                .map(|v| p.layout_no_wrap(format!("{v:.1}"), Tokens::ui(12.0), t.hot_text).size().x + 12.0)
+                .sum();
+            let right = r.max.x - if prop.is_animated() { 52.0 } else { 8.0 };
+            vx.min(right - point - fields + 8.0).max(swr.max.x + 60.0)
+        }
+        _ => vx,
+    };
+    let name_clip =
+        Rect::from_min_max(pos2(swr.max.x + 6.0, r.min.y), pos2(((r.min.x + r.width() * 0.48).max(swr.max.x + 124.0) - 4.0).min(vx - 6.0), r.max.y));
+    p.with_clip_rect(name_clip.intersect(p.clip_rect())).text(pos2(swr.max.x + 6.0, cy), Align2::LEFT_CENTER, &prop.name, Tokens::ui(12.0), t.text);
     let merge = format!("ec-{uid}");
     let set =
         |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v, "merge": merge})));
@@ -200,18 +238,11 @@ fn prop_row(
             }
         }
         Value::Scalar(v) if matches!(prop.ui, ParamUi::Angle) => {
-            let (rev, deg) = fw::split_angle(*v);
-            let prefix = format!("{rev}x{}", if deg < 0.0 { "-" } else { "+" });
-            let g = p.layout_no_wrap(prefix, Tokens::ui(12.0), t.hot_text);
-            let gw = g.size().x;
-            p.galley(pos2(vx + 2.0, cy - g.size().y / 2.0), g, t.hot_text);
-            let (vr, nv, _) = widgets::hot_number_at(ui, pos2(vx + gw, cy - 9.0), egui::Id::new(("ec-v", uid)), deg.abs(), 0.5, (-1e9, 1e9), 1, "°", &t);
-            let full = Rect::from_min_max(pos2(vx, vr.min.y), vr.max);
-            app.auto.add(&format!("effectControls.prop.{uid}.value"), full, &fw::format_angle(*v, 1));
+            let (rr, dr, nv) = fw::angle_field(ui, pos2(vx, cy - 9.0), egui::Id::new(("ec-v", uid)), *v, 1, &t);
+            app.auto.add(&format!("effectControls.prop.{uid}.value"), rr.union(dr), &fw::format_angle(*v, 1));
+            app.auto.add(&format!("effectControls.prop.{uid}.revolutions"), rr, &prop.name);
             if let Some(nv) = nv {
-                // The field edits the degrees part; the revolutions stay.
-                let signed = if deg < 0.0 || (deg == 0.0 && *v < 0.0) { -nv } else { nv };
-                set(actions, json!(rev as f64 * 360.0 + signed));
+                set(actions, json!(nv));
             }
             twirl_open(app, ui);
         }
@@ -250,7 +281,7 @@ fn prop_row(
         }
         Value::Vec2(_) | Value::Vec3(_) => {
             let c = value.components();
-            let n = if prop.shown_dims > 0 && !(layer.is_3d() && c.len() == 3) { prop.shown_dims as usize } else { c.len() };
+            let n = shown_dims(layer, prop, &value);
             let mut x = vx;
             if matches!(prop.ui, ParamUi::Point | ParamUi::Point3) {
                 let cr = Rect::from_center_size(pos2(x + 8.0, cy), vec2(18.0, 18.0));
@@ -364,6 +395,12 @@ fn prop_row(
         }
         _ => {}
     }
+}
+
+/// How many of a vector parameter's values show (a 3D point's Z only on a 3D layer).
+fn shown_dims(layer: &Layer, prop: &Property, value: &Value) -> usize {
+    let n = value.components().len();
+    if prop.shown_dims > 0 && !(layer.is_3d() && n == 3) { prop.shown_dims as usize } else { n }
 }
 
 /// Colour of a gradient at `f` (colour stops only).
@@ -892,12 +929,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.text(pos2(hdr.min.x + 10.0, hdr.center().y), Align2::LEFT_CENTER, format!("{} • {}", comp_name, layer.name), Tokens::ui(11.5), t.text_dim);
     p.line_segment([hdr.left_bottom(), hdr.right_bottom()], Stroke::new(1.0, t.separator));
     let body = Rect::from_min_max(pos2(rect.min.x, hdr.max.y), rect.max);
-    let scroll_id = egui::Id::new("ec-scroll");
-    let mut scroll: f32 = ctx.data(|d| d.get_temp(scroll_id).unwrap_or(0.0));
-    if ui.rect_contains_pointer(body) {
-        scroll = (scroll - ui.input(|i| i.smooth_scroll_delta.y)).max(0.0);
-    }
-    let mut y = body.min.y + 4.0 - scroll;
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("ec-scroll"), body);
+    let mut y = body.min.y + 4.0 - scroll.offset;
     let mut actions: Actions = vec![];
     let bp = p.with_clip_rect(body);
     // Rows scroll under the header: clip their widgets (and hit tests) to the body.
@@ -932,7 +965,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let selected = app.session.state.selected_props.iter().any(|(l, u)| *l == layer.id && *u == g.uid);
         bp.rect_filled(r, 0.0, if selected { Color32::from_rgb(0x2f, 0x3a, 0x52) } else { Color32::from_rgb(0x2a, 0x2a, 0x2a) });
         let fxr = Rect::from_center_size(pos2(r.min.x + 14.0, r.center().y), vec2(16.0, 16.0));
-        if widgets::icon_toggle(ui, fxr, Icon::Fx, g.enabled, &t, egui::Id::new(("ec-fx", g.uid)), None).clicked() {
+        if widgets::icon_toggle(ui, fxr, Icon::Fx, g.enabled, &t, egui::Id::new(("ec-fx", g.uid)), Sense::click()).clicked() {
             actions.push(("effect.toggle".into(), json!({"layer": layer.id.0, "effect": g.uid})));
         }
         app.auto.add(&format!("effectControls.effect.{}.fx", g.uid), fxr, &g.name);
@@ -1049,10 +1082,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ctx.data_mut(|d| d.remove::<u64>(drag_id));
         }
     }
+    // Right-click anywhere a control has no menu of its own: the Effect menu, which applies to
+    // the selected layers (After Effects). Drawn after the rows, whose menus open first.
+    let menu_id = bg.id.with("effect-menu");
+    let open = ui.input(|i| i.pointer.secondary_clicked())
+        && ui.rect_contains_pointer(body)
+        && (!egui::Popup::is_any_open(&ctx) || egui::Popup::is_id_open(&ctx, menu_id));
+    egui::Popup::context_menu(&bg).id(menu_id).open_memory(open.then_some(egui::SetOpenCommand::Bool(true))).show(|ui| {
+        ui.set_min_width(200.0);
+        actions.extend(crate::menus::menu_contents(app, ui, "Effect"));
+    });
     ui.set_clip_rect(panel_clip);
-    let content_h = y + scroll - body.min.y;
-    scroll = scroll.min((content_h - body.height()).max(0.0));
-    ctx.data_mut(|d| d.insert_temp(scroll_id, scroll));
+    let content_h = y + scroll.offset - body.min.y;
+    scroll.end(ui, &mut app.auto, "effectControls.scroll", content_h, &t);
     // Drop effects here.
     if let Some(payload) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx)
         && ui.rect_contains_pointer(rect)
@@ -1063,6 +1105,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             actions.push(("effect.apply".into(), json!({"effect": e, "layers": [layer.id.0]})));
             egui::DragAndDrop::clear_payload(&ctx);
         }
+    }
+    if ui.input(|i| i.pointer.primary_down()) && actions.iter().any(|(id, _)| id == "prop.set") {
+        app.ui.viewer.property_interacting = true;
+        ctx.request_repaint();
     }
     for (id, params) in actions {
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {
@@ -1098,7 +1144,13 @@ pub fn viewer_hook(
             app.ui.fx_pick = None;
             return;
         };
-        if pick.kind == "color" {
+        // Keyers pick from their input (the shown frame is already keyed): `effect.pickColor`.
+        let keyer = (pick.kind == "color")
+            .then(|| layer.effects()?.groups().find(|g| g.find(pick.prop).is_some()))
+            .flatten()
+            .filter(|g| effectcraft_engine::effects::find(&g.match_id).is_some_and(|s| s.category == "Keying"))
+            .map(|g| g.uid);
+        if pick.kind == "color" && keyer.is_none() {
             // GPU frames: read the shown frame back for sampling.
             app.viewer_pixels();
         }
@@ -1113,6 +1165,7 @@ pub fn viewer_hook(
             let c = map.to_comp(hp);
             app.pointer_comp = Some([c[0] as f32, c[1] as f32]);
             if pick.kind == "color"
+                && keyer.is_none()
                 && let Some(img) = &app.viewer_image
                 && let Some(s) = fw::sample_frame(img, map.comp, c)
             {
@@ -1128,6 +1181,15 @@ pub fn viewer_hook(
             if pick.kind == "point" {
                 if let Some(lp) = fw::comp_to_layer(&l2c(ectx, &layer), c) {
                     actions.push(("prop.set".into(), json!({"layer": pick.layer, "prop": pick.prop, "value": [lp[0], lp[1]]})));
+                }
+            } else if let Some(fx) = keyer {
+                // Ctrl/Cmd+click averages the 5 × 5 pixels around the point.
+                if let Some(lp) = fw::comp_to_layer(&l2c(ectx, &layer), c) {
+                    let average = ui.input(|i| i.modifiers.command);
+                    actions.push((
+                        "effect.pickColor".into(),
+                        json!({"layer": pick.layer, "effect": fx, "prop": pick.prop, "x": lp[0], "y": lp[1], "average": average}),
+                    ));
                 }
             } else if let Some(img) = &app.viewer_image
                 && let Some(s) = fw::sample_frame(img, map.comp, c)

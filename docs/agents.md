@@ -36,12 +36,42 @@ You can also register it from the command line:
 Desktop, Cursor and the like) take the same `command` and `args`.
 
 - **Headless** (`["mcp"]`): an in-process session with no window. Add `"--demo"` or
-  `"--project", "file.ecproj"` to start with content. Startup is instant.
+  `"--project", "file.ecproj"` to start with content. Startup is instant. It renders on the CPU
+  unless you add `"--gpu"` (`["mcp", "--gpu"]`), which attaches the GPU compositor on a device of
+  its own; if no adapter is usable the server says why and exits. `get_project`'s `renderer`
+  (`render.backend`) reports `active` (`gpu` / `cpu`) and, on the CPU, `why`.
 - **Bridge** (`["mcp", "--bridge", "9877"]`): drives a running `effectcraft --control 9877`, so you
   see every change live. Bridge mode adds `screenshot` and the `ui_*` tools.
 
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
 2025-06-18, 2025-03-26 and 2024-11-05 (`initialize`, `ping`, `tools/list`, `tools/call`).
+
+### Keeping headless work across restarts
+
+Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`) to preserve
+unsaved headless work. Each tool call that changes a dirty project writes a checkpoint before
+its reply is sent, so even killing the server after that reply leaves the work on disk. EOF
+and transport errors also flush outstanding changes. Queries do not rotate the saved versions.
+A failed checkpoint adds a warning to the tool reply; the edit remains in memory and the next
+call retries. Use `save_project {path}` to a writable location before disconnecting if warned.
+
+Each server has its own folder under `<config directory>/EffectCraft Auto-Save/MCP/` (or
+`<custom Auto-Save folder>/MCP/`). The maximum-version setting applies within that folder.
+`--autosave` enables these checkpoints regardless of the desktop's Auto-Save toggle and interval;
+it reads settings without writing desktop preferences, shortcuts or crash-recovery state.
+`EFFECTCRAFT_CONFIG_DIR` overrides the platform config directory. Session folders are retained
+for recovery; remove old folders once their work is saved elsewhere.
+
+`initialize` instructions and `_meta.effectcraftAutoSave` list the current folder and up to five
+previous dirty sessions; `get_project.autosave` also reports the latest checkpoint and errors.
+Recover explicitly with `open_project {"path":"<checkpoint .ecproj>"}`, then
+`save_project {"path":"Recovered.ecproj"}`. Prior sessions may still be running and are never
+opened automatically. Replacing a dirty project with `open_project` or `file.newProject` discards
+it intentionally; save it first. The metadata describes the current project in each session.
+
+Without `--autosave`, headless work is in memory until explicitly saved. The flag is headless
+only; a bridged desktop app owns its auto-saves. An edit interrupted before its reply is received
+may be absent from the last checkpoint.
 
 ### Tools
 
@@ -53,17 +83,20 @@ The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MC
 | `get_state` | Editor state (active comp, time, selections, tool) plus `app`: version, command and effect counts, export formats, parity summary. |
 | `run_script {code, name?}` | Run JavaScript with the After Effects-style scripting object model (`app.project`, `comp.layers.addText(…)`, `layer.property("ADBE Transform Group").property("ADBE Position").setValueAtTime(…)`…). Returns `{ok, result, output, error: {message, line, column}}`; edits are undoable. |
 | `get_project` / `get_comp {comp?}` | Project items, comp settings and layers. |
-| `get_layer {layer, comp?, time?, flat?}` | A layer's property tree. Every node has a `path`. |
+| `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
 | `get_property {layer, path, comp?, time?}` | Value at a time, keyframes and expression. |
 | `set_property {layer, path, value?, time?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe; with `expression` it sets an expression. |
-| `add_keyframe {layer, path, time+value \| keys:[...], interpolation?}` | Adds keys, then optionally applies linear/bezier/hold/easyEase. |
+| `add_keyframe {layer, path, time+value \| keys:[...], interpolation?, comp?}` | Adds keys, then optionally applies linear/bezier/hold/easyEase. |
 | `list_effects {filter?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters. |
-| `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call; returns the instance path (`effects/#n`) and its parameter paths. |
+| `list_fonts {query?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin and own-language name; `rescan` picks up fonts installed since launch. |
+| `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |
 | `render_frame {comp?, time?, max_side?, path?, inline?, transparent?}` | Returns a PNG image of a frame; `transparent: true` keeps the alpha (as an RGB + Alpha render writes it) instead of compositing over the comp background. |
 | `open_project {path \| demo \| new}` / `save_project {path?}` | Open and save files. |
 | `undo {steps?}` / `redo {steps?}` | History. |
+| `history {goto?}` | The branching undo history (History panel): every state with its index, id, label, branch depth and whether it's current; `goto` (an index or id) jumps to any state, on any branch, without losing the others. |
+| `script_ui {action?, window?, widget?, value?, result?}` | Drive ScriptUI windows that scripts opened: `list` (default) the open windows, `get` a window's control tree, `click` a button / checkbox / radio button, `set` text, a slider or a list item, `close` a window (`result`: what a dialog's `show()` returns, default 2 = Cancel). |
 | `batch {steps: [{command, params}], label?, atomic?}` | Several commands in one call and one undo step (`engine.batch`); `"$N.key"` in a param is step N's result (`"$1.layer"`). A failing step rolls the batch back and names the step. |
-| *(bridge)* `screenshot {panel?, id?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the live window. |
+| *(bridge)* `screenshot {panel?, id?, max_side?, path?}`, `ui_inspect`, `ui_elements {prefix?}`, `ui_click`, `ui_drag`, `ui_key`, `ui_type`, `ui_set`, `control {method, params}` | Look at and operate the live window. |
 
 Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the top) or name. Comps are
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
@@ -94,6 +127,7 @@ Short recipes; every step is one tool call.
 | Title card | `execute_command comp.new {...}` → `execute_command layer.newText {"text":"Hi","size":120}` → `render_frame {"time":0}` |
 | Animate | `add_keyframe {"layer":2,"path":"transform/scale","keys":[{"time":0,"value":[0,0]},{"time":0.5,"value":[100,100]}],"interpolation":"easyEase"}` |
 | Effect with settings | `list_effects {"filter":"glow"}` → `add_effect {"layer":2,"effect":"Glow","values":{"threshold":40,"radius":30}}` → `set_property {"layer":2,"path":"effects/#1/intensity","value":2}` |
+| Key a green screen | `add_effect {"layer":2,"effect":"Keylight (1.2)"}` → `execute_command effect.pickColor {"layer":2,"effect":1,"param":"screenColour","x":20,"y":20,"average":true}` (a screen pixel, layer space; samples the effect's input) → `set_property {"layer":2,"path":"effects/#1/screenMatte/clipBlack","value":10}` → `render_frame {"transparent":true}` |
 | Drive with an expression | `set_property {"layer":2,"path":"transform/rotation","expression":"time*90"}` |
 | Inspect a layer | `get_layer {"layer":2,"flat":true}` (every property with its `path`, value, key count) |
 | Check the result | `render_frame {"time":1.5,"max_side":640}`; in bridge mode `screenshot {"panel":"Timeline"}` |
@@ -103,6 +137,31 @@ Short recipes; every step is one tool call.
 
 The desktop app checks footage in the background after every open (a "Checking footage" job in
 the Progress panel, `jobs.list`); headless sessions run `footage.check` when they want it.
+
+### Pitfalls
+
+Things that tripped up a long agent-driven session (a multi-scene 3D piece built entirely over MCP).
+
+- **Layer time vs comp time.** `add_keyframe`, `set_property` with `time`, `prop.addKey`,
+  `keys.select` and `keys.set` take layer time; `get_property` and `render_frame` take comp time;
+  `run_script`'s `setValueAtTime` and `keyTime` use comp time, as in After Effects. On a layer that
+  doesn't start at 0, such as a nested comp placed later, subtract the layer's start time from the
+  comp time before keying (unstretched layers), or set the keys from `run_script`
+  ([#257](https://github.com/storytold/effectcraft/issues/257)).
+- **Moving a layer in time.** `execute_command layer.timing {"layers":["Scene 2"],"start":5.1}` sets
+  the start time in comp seconds and moves the in and out points with it.
+- **Loops in scripts.** `run_script` can call any engine command with `app.run(id, params)`, for
+  example `app.run("layer.new3dPrimitive", {kind: "cube", position: [x, y, z]})` inside a loop. A
+  script that throws keeps the edits it already made: wrap it in `app.beginUndoGroup()` /
+  `app.endUndoGroup()` so one `undo {}` removes them all. (`batch` rolls back on its own.)
+- **Save early in headless mode.** Without `--autosave` the headless server keeps the project in
+  memory only, so a server restart loses unsaved work: start it with `mcp --autosave` (see above)
+  or call `save_project {"path": …}` after each milestone.
+- **Environment light.** `layer.newLight` also accepts `"kind":"Environment"`: an equirectangular
+  image that metallic surfaces reflect. Set its `lightOptions/source` to a footage, comp or solid
+  layer by layer id; with no source it uses the comp's Environment Layer (`layer.environment`)
+  ([#261](https://github.com/storytold/effectcraft/issues/261)).
+
 ### Cookbook (from end-to-end QA)
 
 The scenarios in `crates/automation/tests/qa/` and `apps/effectcraft-cli/tests/qa_template.rs`
@@ -132,13 +191,16 @@ build real projects through these interfaces; they are worked examples of everyt
 * **One call, one undo step**: `batch {"steps":[{"command":"layer.newShape","params":{"kind":"ellipse","name":"Ring"}},{"command":"layer.addShapeItem","params":{"layer":"$1.layer","kind":"trim"}},{"command":"prop.addKey","params":{"layer":"$1.layer","path":"transform/opacity","time":0,"value":0}}]}`
   (a string param that is exactly `"$N"` or `"$N.key"` is replaced; `$2.path` is the trim's path).
 * **Expressions**: `set_property`/`get_property` replies carry `evaluated` (what renders) next to
-  `value` (the keyframed value) and `expressionError` when the expression fails.
+  `value` (the keyframed value) and `expressionError` when the expression fails. An expression with
+  a syntax error is kept but disabled, so it renders `value` and reports the syntax error.
 * **Keyframes like a person**: `keys.select {keys, toggle: true}` (Shift+click), `keys.selectEqual`
   / `selectPrevious` / `selectFollowing`, `keys.move {delta, merge}` (steps sharing a merge key are
   one drag: each applies to the keys as they were before it, so a key passed over survives) and
   `keys.transform {…, merge, fromStart: true}` (values are the whole transform since the drag
   started). Keys of locked layers can't be selected. Copy / paste: `keys.copy`, then `keys.paste`
   at the current time (keys copied from several layers go to as many selected layers in order).
+  `time.nextKey` / `time.previousKey` / `keys.selectAll` take `visible: [{layer, prop}]` to act
+  only on those properties (the Timeline passes its revealed ones, as J / K and Ctrl+Alt+A do).
 * **Easing with Keyframe Velocity**: select keys by path, `keys.select {"keys":[{"layer":"Ring","path":"contents/trim/end","time":0}]}`,
   then `keys.velocity {"outSpeed":0,"outInfluence":33.33}`.
 * **Gradients**: `set_property {"path":"contents/gfill/colors","value":["#0080ff","#ffff00"]}` or
@@ -203,6 +265,20 @@ Measurements) keys a Face Measurements effect from the Face Track Points (head p
 orientation X/Y/Z, eye openness, eyebrow distance from eye, mouth openness, width and offset), puts
 those keys on the keyframe clipboard and returns them per frame plus a tab-separated `clipboard`
 text.
+
+Face tracking's trained model works like Roto Brush's (below): `face.models` lists the built-in
+tracker and MediaPipe Face Landmarker with its authors and licence; `face.model.download {id}` /
+`face.model.install {path, id?}` install it (verified); `face.model.select {id:
+classical|mediapipe-face}` chooses it; `face.model.remove {id}` deletes it. Downloads and loading
+run in the background; `"wait": true` on download, install or select returns once the model is in
+use (or with its error), which scripts need before tracking. `track.mask` with a
+face method returns `faceModel`, the engine it tries first (the classical one when the model finds
+no face in the mask).
+
+```sh
+effectcraft-cli run clip.ecproj face.model.download '{"id":"mediapipe-face","wait":true}' face.model.select '{"id":"mediapipe-face","wait":true}' \
+  track.mask '{"layer":"#1","mask":1,"method":"faceDetailed","direction":"forward","wait":true}' --save
+```
 
 `mask.interpolate` (Window ▸ Mask Interpolation ▸ Apply) adds in-between Mask Path keys between
 each pair of selected Mask Path keys (or the existing keys at `times`, in seconds), giving both
@@ -292,6 +368,22 @@ state, job progress and, for a frame, the matte's area, centroid, RLE matte and 
 reference. Matte settings are ordinary properties (`effects/#1/rotoBrushMatte/searchRadius`,
 `effects/#1/refineEdgeMatte/decontaminateEdgeColors`, …).
 
+Trained model (Roto Brush 2.0 / 3.0):
+- `roto.models` lists the built-in engine and every registered model, with its authors,
+  licence, size, URL, SHA-256 and whether it is installed, selected and active.
+- `roto.model.download {id}` fetches and verifies the official weights in the background;
+  `roto.model.install {path, id?}` installs a file you already have.
+- `roto.model.select {id: classical|mobilesam}` chooses which one Roto Brush uses. Loading runs
+  in the background; `"wait": true` (also on download and install) returns once it is in use.
+- `roto.model.remove {id}` deletes the installed weights.
+- The `version` property (`effects/#1/version`: 0 = 1.0, 1 = 2.0, 2 = 3.0) picks between the
+  classic engine (1.0) and the chosen model (2.0, 3.0).
+
+```sh
+effectcraft-cli run clip.ecproj roto.model.install '{"path":"mobile_sam.pt"}' roto.model.select '{"id":"mobilesam","wait":true}' \
+  roto.stroke '{"layer":"#1","points":[[300,200],[360,230]],"radius":10}' roto.propagate '{"layer":"#1","wait":true}' --save
+```
+
 ```sh
 effectcraft-cli run clip.ecproj roto.stroke '{"layer":"#1","points":[[300,200],[360,230]],"radius":10}' \
   roto.stroke '{"layer":"#1","kind":"bg","points":[[40,40],[600,40]],"radius":12}' \
@@ -316,6 +408,12 @@ whole layer, or only characters `range: [start, end]` (character indices): chara
    Character panel does the same); with an empty range it sets the style the next typed text takes.
 4. `edit.copy`, `edit.paste`, `edit.pasteTextMatchFormatting` and `edit.pasteTextFormattingOnly`
    work on the selected text; `text.endEdit` commits (an empty Type-tool layer is removed).
+
+Fonts: `text.fonts` (MCP `list_fonts`) lists every family a text layer can use, bundled and installed, with its
+styles, origin (`bundled`, `system`, `user`) and own-language name (`{"query":"gothic"}` filters
+by name; `{"rescan":true}` first picks up fonts installed since launch). Pass a listed `family` and
+one of its `styles` to `layer.setText {"font", "style"}`; `text.fontFeatures` says which OpenType
+options a font draws with its own glyphs.
 
 In expressions, `text.sourceText.style` / `getStyleAt(i, t)` read styles and the setters
 (`setFontSize(v, start?, count?)`, `setFillColor`, `setText`, `setJustification`…) return a
@@ -388,7 +486,8 @@ that closes the dialog). File ▸ Scripts: `file.scripts.list`, `file.runScript 
 
 Each invocation runs a headless engine with no window. It opens the demo project unless you pass
 `--project F.ecproj`, a positional `*.ecproj` or `--empty`. Add `--json` for one compact JSON document
-on stdout. Errors print `{"error": ...}` and exit with status 1; usage errors exit with status 2.
+on stdout. Errors print `{"error": ...}` and exit with status 1; usage errors, such as an unknown
+option, exit with status 2 before anything runs.
 
 ```sh
 effectcraft-cli info --json
@@ -447,7 +546,8 @@ not read or written.
 
 ## Seeing the UI
 
-To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` and use MCP bridge
+To work on the UI, start the app with `cargo run -p effectcraft -- --control 9877` (add `--demo` to
+open the demo project; without it the app starts with an empty project) and use MCP bridge
 mode or the raw control channel. A good loop is: `ui_elements` to find an id, `ui_click` or `ui_drag`
 to act, then `screenshot {"panel":"Timeline"}` to check the result. `render_frame` shows the
 composition itself at any zoom.

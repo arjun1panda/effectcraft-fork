@@ -255,6 +255,7 @@ fn lift_and_extract_work_area() {
 
 #[test]
 fn label_group_purge_and_edit_original() {
+    crate::tests_roto::hold_roto_cache_test_lock();
     let mut s = comp();
     let a = solid(&mut s, "#ff0000");
     let b = solid(&mut s, "#00ff00");
@@ -1029,4 +1030,119 @@ fn j_and_k_stop_at_keys_markers_and_the_work_area() {
     }
     let last = (3.0 * 30.0 - 1.0) / 30.0;
     assert_eq!(stops, vec![1.0, 2.0, (last * 30.0f64).round() / 30.0, (last * 30.0f64).round() / 30.0]);
+}
+
+#[test]
+fn j_k_and_select_all_use_only_the_properties_the_timeline_shows() {
+    let mut s = comp();
+    let a = solid(&mut s, "#ff0000");
+    opacity_keys(&mut s, a, &[1.0]);
+    s.execute("prop.addKey", json!({"layer": a, "path": "transform/rotation", "time": 2.0, "value": 45})).unwrap();
+    let op = layer(&s, a).props.prop("transform/opacity").unwrap().uid;
+    // Only Opacity is revealed: K skips the hidden Rotation key at 2 s, stopping at 1 s and then
+    // at the work area's end.
+    let visible = json!([{"layer": a, "prop": op}]);
+    s.execute_checked("time.nextKey", json!({"visible": visible})).unwrap();
+    assert_eq!(s.time().seconds(), 1.0);
+    s.execute_checked("time.nextKey", json!({"visible": visible})).unwrap();
+    assert!(s.time().seconds() > 3.9, "work area end, not the hidden key: {}", s.time().seconds());
+    // Without `visible` (agents), every key of the layers counts, as before.
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    s.execute("time.nextKey", json!({})).unwrap();
+    assert_eq!(s.time().seconds(), 2.0);
+    // Select All Keyframes: the shown properties' keys only.
+    s.execute_checked("keys.selectAll", json!({"visible": visible})).unwrap();
+    assert_eq!(s.state.selected_keys.len(), 1);
+    assert_eq!(s.state.selected_keys[0].prop, op);
+}
+
+/// A shape layer's Contents names, top to bottom.
+fn contents_names(s: &Session, id: u64) -> Vec<String> {
+    layer(s, id).props.sub("contents").unwrap().groups().map(|g| g.name.clone()).collect()
+}
+
+/// The uid of the shape item `name` at the top level of a shape layer's Contents.
+fn contents_item(s: &Session, id: u64, name: &str) -> u64 {
+    layer(s, id).props.sub("contents").unwrap().groups().find(|g| g.name == name).unwrap().uid
+}
+
+/// Edit ▸ Copy / Cut / Paste with shape items selected copy the items, not their layer: Paste
+/// puts them into the selected shape layer, above its selected item or on top, and Cut + Paste
+/// moves them (#227).
+#[test]
+fn shape_contents_copy_cut_and_paste_between_shape_layers() {
+    let mut s = comp();
+    let a = s.execute("layer.newShape", json!({"kind": "rect"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("shape.newShape", json!({"layer": a, "kind": "ellipse"})).unwrap();
+    let b = s.execute("layer.newShape", json!({"kind": "star", "name": "B"})).unwrap()["layer"].as_u64().unwrap();
+    let n = s.active_comp().unwrap().layers.len();
+    // Copy Rectangle 1 of A; paste into B (nothing of B's selected): on top of its Contents.
+    let rect = contents_item(&s, a, "Rectangle 1");
+    s.execute("prop.select", json!({"layer": a, "prop": rect})).unwrap();
+    assert_eq!(s.execute("edit.copy", json!({})).unwrap()["contents"], json!(1));
+    assert!(s.state.clipboard.is_empty(), "not the layer");
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let r = s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(contents_names(&s, b), ["Rectangle 1", "Polystar 1"]);
+    assert_eq!(s.active_comp().unwrap().layers.len(), n, "no new layer");
+    let pasted = r["contents"][0].as_u64().unwrap();
+    assert_ne!(pasted, rect);
+    assert_eq!(s.state.selected_props, vec![(effectcraft_project::LayerId(b), pasted)]);
+    // Again, with the pasted item selected: above it, with a unique name.
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(contents_names(&s, b), ["Rectangle 2", "Rectangle 1", "Polystar 1"]);
+    s.undo();
+    assert_eq!(contents_names(&s, b), ["Rectangle 1", "Polystar 1"]);
+    assert_eq!(contents_names(&s, a), ["Ellipse 1", "Rectangle 1"], "the original stays");
+    // Cut Ellipse 1 from A and paste it above B's Polystar 1: it moves.
+    s.execute("prop.select", json!({"layer": a, "prop": contents_item(&s, a, "Ellipse 1")})).unwrap();
+    s.execute("edit.cut", json!({})).unwrap();
+    assert_eq!(contents_names(&s, a), ["Rectangle 1"]);
+    assert_eq!(s.active_comp().unwrap().layers.len(), n, "the layer stays");
+    s.execute("prop.select", json!({"layer": b, "prop": contents_item(&s, b, "Polystar 1")})).unwrap();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(contents_names(&s, b), ["Rectangle 1", "Ellipse 1", "Polystar 1"]);
+    s.undo();
+    s.undo();
+    assert_eq!(contents_names(&s, a), ["Ellipse 1", "Rectangle 1"]);
+    assert_eq!(contents_names(&s, b), ["Rectangle 1", "Polystar 1"]);
+    // Only shape layers take shape items.
+    let sol = solid(&mut s, "#ffffff");
+    s.execute("layer.select", json!({"layers": [sol]})).unwrap();
+    assert!(s.execute("edit.paste", json!({})).is_err());
+}
+
+/// Edit ▸ Duplicate with shape items selected duplicates them in their layer, above the
+/// original and named "Rectangle 2", not the layer (#227).
+#[test]
+fn duplicate_with_shape_items_selected_duplicates_them_in_place() {
+    let mut s = comp();
+    let a = s.execute("layer.newShape", json!({"kind": "rect"})).unwrap()["layer"].as_u64().unwrap();
+    let n = s.active_comp().unwrap().layers.len();
+    let rect = contents_item(&s, a, "Rectangle 1");
+    s.execute("prop.select", json!({"layer": a, "prop": rect})).unwrap();
+    let r = s.execute("edit.duplicate", json!({})).unwrap();
+    assert_eq!(contents_names(&s, a), ["Rectangle 2", "Rectangle 1"]);
+    assert_eq!(s.active_comp().unwrap().layers.len(), n, "no new layer");
+    let copy = r["contents"][0].as_u64().unwrap();
+    assert_eq!(s.state.selected_props, vec![(effectcraft_project::LayerId(a), copy)]);
+    let l = layer(&s, a);
+    let path_uid = |g: u64| l.props.find_group(g).unwrap().sub("contents").unwrap().groups().next().unwrap().uid;
+    assert_ne!(path_uid(copy), path_uid(rect), "the copy has its own properties");
+    // Again, with the copy selected: Rectangle 3, above it.
+    s.execute("edit.duplicate", json!({})).unwrap();
+    assert_eq!(contents_names(&s, a), ["Rectangle 3", "Rectangle 2", "Rectangle 1"]);
+    s.undo();
+    s.undo();
+    assert_eq!(contents_names(&s, a), ["Rectangle 1"]);
+    // An item inside a group is duplicated in that group.
+    let fill = layer(&s, a).props.find_group(rect).unwrap().sub("contents").unwrap().groups().find(|g| g.match_id == "fill").unwrap().uid;
+    s.execute("prop.select", json!({"layer": a, "prop": fill})).unwrap();
+    s.execute("edit.duplicate", json!({})).unwrap();
+    let inner: Vec<String> = layer(&s, a).props.find_group(rect).unwrap().sub("contents").unwrap().groups().map(|g| g.name.clone()).collect();
+    assert_eq!(inner, ["Rectangle Path 1", "Fill 2", "Fill 1"]);
+    // With only the layer selected, the layer is duplicated as before.
+    s.execute("layer.select", json!({"layers": [a]})).unwrap();
+    s.execute("edit.duplicate", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), n + 1);
 }

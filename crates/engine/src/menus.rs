@@ -52,6 +52,8 @@ pub enum MenuNode {
 pub struct DynCtx<'a> {
     /// The current workspace (Window ▸ Assign Shortcut to "…" Workspace).
     pub workspace: Option<&'a str>,
+    /// Workspaces the user saved (Save as New Workspace), listed in Window ▸ Workspace.
+    pub saved_workspaces: &'a [String],
 }
 
 fn file_name(p: &str) -> String {
@@ -70,8 +72,9 @@ fn holder_of(s: &Session, keys: &str) -> Option<String> {
 
 /// The entries of a `@dynamic:<name>` node, and the disabled placeholder shown when there are
 /// none: `recentProjects`, `recentFootage`, `recentPresets`, `history` (undo steps, newest
-/// first), `view3dShortcuts`, `workspaceShortcuts` and `openViewers` (open compositions other
-/// than the active one), `scripts` (File ▸ Scripts) and `scriptPanels` (ScriptUI panels).
+/// first), `view3dShortcuts`, `workspaceShortcuts`, `savedWorkspaces` (Window ▸ Workspace) and
+/// `openViewers` (open compositions other than the active one), `scripts` (File ▸ Scripts) and
+/// `scriptPanels` (ScriptUI panels).
 pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<&'static str>) {
     use serde_json::json;
     let indexed = |list: &[String], cmd: &str, stem: bool| -> Vec<MenuEntry> {
@@ -122,6 +125,7 @@ pub fn dynamic(s: &Session, name: &str, cx: &DynCtx) -> (Vec<MenuEntry>, Option<
                 .collect(),
             None,
         ),
+        "savedWorkspaces" => (cx.saved_workspaces.iter().map(|w| dyn_entry(w.clone(), "window.workspace", json!({"name": w}))).collect(), None),
         "openViewers" => (
             s.state
                 .open_comps
@@ -1046,6 +1050,7 @@ Animation
   Reveal Properties with Animation | anim.reveal {"kind":"animation"}
   Reveal All Modified Properties | anim.reveal {"kind":"modified"}
 View
+  New Viewer | view.newViewer
   Split with New Locked Viewer | view.splitLockedViewer
   ---
   Zoom In | view.zoomIn
@@ -1150,6 +1155,7 @@ Window
     Paint | window.workspace {"name":"Paint"}
     Text | window.workspace {"name":"Text"}
     Undocked Panels | window.workspace {"name":"Undocked Panels"}
+    @dynamic:savedWorkspaces
     ---
     Reset to Saved Layout | window.resetWorkspace
     Save Changes to this Workspace | window.saveWorkspace
@@ -1194,6 +1200,7 @@ Window
   @dynamic:openViewers
   ---
   Create Nulls From Paths | window.panel {"panel":"createNullsFromPaths"}
+  Ease Presets | window.panel {"panel":"easePresets"}
   VR Comp Editor | window.panel {"panel":"vrCompEditor"}
   @dynamic:scriptPanels
 Help

@@ -347,6 +347,11 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
+    /// Top-left corner of the layer bounds ([`EffectCtx::layer_size`]) in layer coordinates:
+    /// (0, 0) for layers with a source rectangle; shape and text layers have comp-sized bounds
+    /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
+    /// ([`util::pin_rect`]).
+    pub bounds_origin: [f64; 2],
 }
 
 /// What an effect gets to render with.
@@ -504,14 +509,25 @@ pub fn categories() -> Vec<&'static str> {
     v
 }
 
+/// After Effects' third-party display names of effects we register under a generic name.
+const ALIASES: &[(&str, &[&str])] = &[("ec.keying.keylight", keylight::KEYLIGHT_ALIASES)];
+
+/// Other names effect `id` answers to (in [`lookup`] and searches).
+pub fn aliases(id: &str) -> &'static [&'static str] {
+    ALIASES.iter().find(|(i, _)| *i == id).map_or(&[], |(_, a)| a)
+}
+
+/// Search (Effects & Presets, `effect.list`): the display name or one of its [`aliases`]
+/// contains `query` (lowercase).
+pub fn name_matches(spec: &EffectSpec, query: &str) -> bool {
+    std::iter::once(spec.name).chain(aliases(spec.id).iter().copied()).any(|n| n.to_lowercase().contains(query))
+}
+
 /// Find by id or (case-insensitive) display name.
 pub fn lookup(name_or_id: &str) -> Option<&'static EffectSpec> {
     find(name_or_id)
         .or_else(|| all().into_iter().find(|s| s.name.eq_ignore_ascii_case(name_or_id)))
-        .or_else(|| {
-            // After Effects' third-party display names we register under a generic name.
-            keylight::KEYLIGHT_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name_or_id)).then(|| find("ec.keying.keylight")).flatten()
-        })
+        .or_else(|| ALIASES.iter().find(|(_, names)| names.iter().any(|a| a.eq_ignore_ascii_case(name_or_id))).and_then(|(id, _)| find(id)))
         .or_else(|| {
             // Display names of earlier versions.
             migrate::EFFECT_NAME_ALIASES.iter().find(|(old, _)| old.eq_ignore_ascii_case(name_or_id)).and_then(|(_, id)| find(id))
@@ -1096,6 +1112,9 @@ pub const TIME_DEPENDENT: &[&str] = &[
     "ec.obsolete.lightning",
     "ec.text.timecode",
     "ec.text.numbers",
+    // The audio visualisers read the Audio Layer's samples around the frame time.
+    "ec.generate.audiospectrum",
+    "ec.generate.audiowaveform",
     // Path Text's jitter changes every frame.
     "ec.obsolete.pathtext",
     // Time effects read neighbouring frames of the layer.

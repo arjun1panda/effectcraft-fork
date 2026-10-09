@@ -81,6 +81,8 @@ impl Exporter for FileExporter {
 /// A new session with media, import, expressions, scripting and export enabled.
 pub fn session() -> Session {
     Session {
+        // The desktop app, the CLI and the MCP server share installed Roto Brush models.
+        models_dir: config_dir().map(|d| d.join("models")),
         exporter: Some(Arc::new(FileExporter::default())),
         footage: Arc::new(effectcraft_media::MediaPool::new()),
         importer: Some(Arc::new(MediaImporter)),
@@ -91,6 +93,24 @@ pub fn session() -> Session {
         plugin_loader: effectcraft_plugin::wasm_available().then_some(effectcraft_plugin::loader as effectcraft_engine::PluginLoader),
         ..Default::default()
     }
+}
+
+/// The platform config directory for EffectCraft (`EFFECTCRAFT_CONFIG_DIR` overrides):
+/// `~/Library/Application Support/EffectCraft` (macOS), `%APPDATA%\EffectCraft` (Windows),
+/// `$XDG_CONFIG_HOME/effectcraft` or `~/.config/effectcraft` (Linux and others).
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(d) = std::env::var_os("EFFECTCRAFT_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home().map(|h| h.join("Library/Application Support/EffectCraft"));
+    }
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("EffectCraft"));
+    }
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| home().map(|h| h.join(".config"))).map(|c| c.join("effectcraft"))
 }
 
 #[cfg(test)]
@@ -185,6 +205,58 @@ mod tests {
         assert!(s.render(cid, s.time(), opts).data.iter().all(|p| p[3] == 0.0));
     }
 
+    /// A binary glTF of a red cube 2 units wide (positions and indices only).
+    fn glb_cube() -> Vec<u8> {
+        let mut bin: Vec<u8> = (0..8u32).flat_map(|i| [i & 1, (i >> 1) & 1, (i >> 2) & 1].map(|b| b as f32 * 2.0 - 1.0)).flat_map(f32::to_le_bytes).collect();
+        let faces: [[u16; 4]; 6] = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+        bin.extend(faces.iter().flat_map(|f| [f[0], f[1], f[2], f[0], f[2], f[3]]).flat_map(u16::to_le_bytes));
+        let gltf = json!({
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1, 0, 0, 1], "metallicFactor": 0, "roughnessFactor": 1}}],
+            "buffers": [{"byteLength": bin.len()}],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 96}, {"buffer": 0, "byteOffset": 96, "byteLength": 72}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3", "min": [-1, -1, -1], "max": [1, 1, 1]},
+                {"bufferView": 1, "componentType": 5123, "count": 36, "type": "SCALAR"}
+            ]
+        });
+        let mut text = gltf.to_string().into_bytes();
+        text.resize(text.len().div_ceil(4) * 4, b' ');
+        let chunk = |kind: &[u8; 4], data: &[u8]| [&(data.len() as u32).to_le_bytes()[..], kind, data].concat();
+        let body = [chunk(b"JSON", &text), chunk(b"BIN\0", &bin)].concat();
+        [&b"glTF"[..], &2u32.to_le_bytes(), &(12 + body.len() as u32).to_le_bytes(), &body].concat()
+    }
+
+    /// #264: a model imported into a new composition (Classic 3D by default) was invisible on
+    /// every renderer, because only Advanced 3D draws models. Adding it now switches the comp,
+    /// and the software renderer (no GPU, as on the reporter's Intel HD Graphics 5500) draws it.
+    #[test]
+    fn imported_glb_shows_in_a_new_composition() {
+        let path = std::env::temp_dir().join(format!("effectcraft-264-cube-{}.glb", std::process::id()));
+        std::fs::write(&path, glb_cube()).unwrap();
+        let mut s = super::session();
+        assert!(s.accel.is_none(), "renders in software");
+        let r = s.execute("file.import", json!({"paths": [path.to_string_lossy()]})).unwrap();
+        assert_eq!(r["errors"], json!([]), "{r}");
+        s.state.project_selection = vec![effectcraft_project::ItemId(r["items"][0].as_u64().unwrap())];
+        s.execute("file.newCompFromSelection", json!({})).unwrap();
+        let comp = s.active_comp().unwrap();
+        assert_eq!(comp.renderer, effectcraft_project::Renderer::Advanced3D);
+        let layer = comp.layers[0].id.0;
+        s.execute("prop.set", json!({"layer": layer, "path": "transform/rotationY", "value": 30})).unwrap();
+        s.execute("prop.set", json!({"layer": layer, "path": "transform/rotationX", "value": 20})).unwrap();
+        let cid = s.active_comp_id().unwrap();
+        let img = s.render(cid, s.time(), effectcraft_engine::render::RenderOpts { scale: 0.25, ..Default::default() });
+        let red = img.data.iter().filter(|p| p[3] > 0.99 && p[0] > 0.2 && p[1] < 0.05 && p[2] < 0.05).count();
+        let _ = std::fs::remove_file(&path);
+        // Half the comp height wide, seen at an angle: well over 5% of the frame.
+        assert!(red * 20 > img.data.len(), "red cube pixels: {red} of {}", img.data.len());
+    }
+
     /// The web app's path: outputs go to a sink (downloads), never to the file system.
     #[test]
     fn render_queue_exports_to_a_sink() {
@@ -209,8 +281,10 @@ mod tests {
         s.poll_render();
         let mut got = got.lock().unwrap().clone();
         got.sort_by(|a, b| a.0.cmp(&b.0));
-        let names: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(names, [format!("{dir}/a.gif"), format!("{dir}/seq_00.png"), format!("{dir}/seq_01.png"), format!("{dir}/seq_02.png")]);
+        let names: Vec<std::path::PathBuf> = got.iter().map(|(p, _)| std::path::PathBuf::from(p)).collect();
+        let expected = [format!("{dir}/a.gif"), format!("{dir}/seq_00.png"), format!("{dir}/seq_01.png"), format!("{dir}/seq_02.png")]
+            .map(|p| std::path::absolute(p).unwrap());
+        assert_eq!(names, expected);
         assert!(got[0].1.starts_with(b"GIF89a"));
         assert!(got[1].1.starts_with(b"\x89PNG"));
         assert!(!std::path::Path::new(dir).exists());

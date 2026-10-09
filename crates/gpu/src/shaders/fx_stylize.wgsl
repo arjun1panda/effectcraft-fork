@@ -44,7 +44,7 @@ fn fxs_qdiv(x: vec3<f32>, a: f32) -> vec3<f32> {
 }
 
 fn fxs_rem2(i: i32) -> i32 {
-    return ((i % 2) + 2) % 2;
+    return imod(i, 2);
 }
 
 // ---------------------------------------------------------------- per-pixel colour effects
@@ -257,7 +257,7 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
             let d = sqrt(dx * dx + dy * dy);
             if (d < r && d != 0.0) {
                 let nd = d / r;
-                let k = (asin(nd) / FXS_HALF_PI) / nd;
+                let k = (asin_p(nd) / FXS_HALF_PI) / nd;
                 s = vec2<f32>(c.x + dx * k, c.y + dy * k);
             }
         }
@@ -453,10 +453,15 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
                 u = bu + (u - bu) * persp;
                 v = bv + (v - bv) * persp;
             }
-            if (u < -1e-9 || u > 1.0 + 1e-9 || v < -1e-9 || v > 1.0 + 1e-9) {
+            // The CPU's 1e-9 edge allowance disappears in f32 at 1.0. Allow eight
+            // f32 ULPs for the inverse solve so exact quad-edge pixels remain covered.
+            let edge = 0.00000095367431640625;
+            if (u < -edge || u > 1.0 + edge || v < -edge || v > 1.0 + edge) {
                 textureStore(out, p, vec4<f32>(0.0));
                 return;
             }
+            u = clamp(u, 0.0, 1.0);
+            v = clamp(v, 0.0, 1.0);
             let rc = P.f[5];
             let lx = rc.x + u * rc.z;
             let ly = rc.y + v * rc.w;
