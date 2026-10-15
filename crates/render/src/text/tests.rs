@@ -100,6 +100,30 @@ fn range_based_on_words_and_lines() {
 }
 
 #[test]
+fn range_start_end_and_offset_are_capped() {
+    let (mut p, cid, comp) = setup(400, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCD", 30.0));
+    let a = animator(&mut p, &mut l, &["opacity"], &["range"]);
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/smoothness", Value::Scalar(0.0));
+    // End 300% is capped at 100% (Offset -150% at -100%): the range is -100%..0% and selects nothing.
+    // Uncapped it would be -150%..150% and select everything.
+    set(&mut l, "text/animators/#1/selectors/#1/end", Value::Scalar(300.0));
+    set(&mut l, "text/animators/#1/selectors/#1/offset", Value::Scalar(-150.0));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    assert_eq!(selection(&p, cid, 0.0, a), vec![0.0; 4]);
+    // Start -200% is capped at 0%: with Offset 100% the range is 100%..150% and selects nothing.
+    // Uncapped it would be -100%..150% and select everything.
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    set(l, "text/animators/#1/selectors/#1/start", Value::Scalar(-200.0));
+    set(l, "text/animators/#1/selectors/#1/end", Value::Scalar(50.0));
+    set(l, "text/animators/#1/selectors/#1/offset", Value::Scalar(100.0));
+    assert_eq!(selection(&p, cid, 0.0, a), vec![0.0; 4]);
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    set(l, "text/animators/#1/selectors/#1/offset", Value::Scalar(0.0));
+    assert_eq!(selection(&p, cid, 0.0, a), vec![1.0, 1.0, 0.0, 0.0]);
+}
+
+#[test]
 fn selector_modes_and_randomize() {
     let (mut p, cid, comp) = setup(400, 200);
     let mut l = text_layer(&mut p, &comp, doc("ABCDEFGH", 30.0));
@@ -484,4 +508,45 @@ fn caret_follows_animators_and_path_text() {
     assert!(qb.x < 100.5 && qt.x > 100.0, "baseline end on the path, top to its right: {qt:?} {qb:?}");
     let glyph_c = glyph_paths(&c, ly).iter().map(|g| effectcraft_path::bounds(std::slice::from_ref(&g.0)).unwrap().center().y).collect::<Vec<_>>();
     assert!(qt.y > glyph_c[1] && qt.y < glyph_c[2], "between the 2nd and 3rd characters: {} in {glyph_c:?}", qt.y);
+}
+
+/// Glyphs that touch or overlap are drawn as one outline, as After Effects draws a line of text:
+/// no light seam where their anti-aliased edges meet (the crossbars of "ff", #415).
+#[test]
+fn touching_glyphs_join_without_a_seam() {
+    use kurbo::Shape;
+    let glyph = |x0: f64, x1: f64, fill: [f32; 4], reversed: bool| {
+        let path = kurbo::Rect::new(x0, 4.0, x1, 16.0).to_path(0.1);
+        PlacedGlyph {
+            local: if reversed { path.reverse_subpaths() } else { path },
+            m: Mat4::IDENTITY,
+            xf: CharXf::default(),
+            fill,
+            stroke: [0.0; 4],
+            stroke_width: 0.0,
+            apply_fill: true,
+            char_index: 0,
+            rest: [0.0; 2],
+        }
+    };
+    let draw = |glyphs: Vec<PlacedGlyph>, blend: BlendMode| {
+        let geom = TextGeom { doc: TextDoc::default(), glyphs, fill_stroke: 0, blend };
+        let mut img = crate::Image::new(24, 20);
+        draw_glyphs(&geom, &mut img, &Mat3::IDENTITY, 1.0, None);
+        img
+    };
+    let (white, red) = ([1.0; 4], [1.0, 0.0, 0.0, 1.0]);
+    // The shared edge runs through the middle of pixel column 10.
+    let seam = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, false)], BlendMode::Normal).get(10, 10);
+    assert!(seam[3] > 0.999 && seam[0] > 0.999, "touching glyphs leave no seam: {seam:?}");
+    // Outlines wound the other way (another font, a mirrored character) still add up.
+    let seam = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, true)], BlendMode::Normal).get(10, 10);
+    assert!(seam[3] > 0.999, "opposite windings join too: {seam:?}");
+    let overlap = draw(vec![glyph(4.0, 12.0, white, false), glyph(8.0, 17.0, white, true)], BlendMode::Normal).get(10, 10);
+    assert!(overlap[3] > 0.999, "and their overlap stays filled: {overlap:?}");
+    // Characters of other colours, or blended with each other, are still drawn one by one.
+    let two = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, red, false)], BlendMode::Normal).get(10, 10);
+    assert!((two[3] - 0.75).abs() < 0.02, "{two:?}");
+    let multiply = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, false)], BlendMode::Multiply).get(10, 10);
+    assert!(multiply[3] < 0.9, "{multiply:?}");
 }

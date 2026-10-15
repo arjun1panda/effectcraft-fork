@@ -522,14 +522,18 @@ pub enum OutputFormat {
     /// AV1 video (+ AAC audio) in MP4 (`av01`). WebM with AV1: [`OutputFormat::WebM`] with
     /// [`WebmVideoCodec::Av1`].
     Av1,
+    /// Uncompressed 8-bit RGB / ARGB (`raw `) in QuickTime (+ PCM audio), for handing to an
+    /// external encoder.
+    Uncompressed,
 }
 
 impl OutputFormat {
-    pub const ALL: [OutputFormat; 12] = [
+    pub const ALL: [OutputFormat; 13] = [
         OutputFormat::H264,
         OutputFormat::Hevc,
         OutputFormat::Av1,
         OutputFormat::ProRes,
+        OutputFormat::Uncompressed,
         OutputFormat::WebM,
         OutputFormat::PngSequence,
         OutputFormat::JpegSequence,
@@ -554,12 +558,13 @@ impl OutputFormat {
             OutputFormat::Aiff => "AIFF",
             OutputFormat::Hevc => "HEVC (H.265)",
             OutputFormat::Av1 => "AV1",
+            OutputFormat::Uncompressed => "QuickTime (Uncompressed)",
         }
     }
     pub fn extension(self) -> &'static str {
         match self {
             OutputFormat::H264 => "mp4",
-            OutputFormat::ProRes => "mov",
+            OutputFormat::ProRes | OutputFormat::Uncompressed => "mov",
             OutputFormat::PngSequence => "png",
             OutputFormat::JpegSequence => "jpg",
             OutputFormat::TiffSequence => "tif",
@@ -575,7 +580,7 @@ impl OutputFormat {
         matches!(self, OutputFormat::PngSequence | OutputFormat::JpegSequence | OutputFormat::TiffSequence | OutputFormat::ExrSequence)
     }
     pub fn is_movie(self) -> bool {
-        matches!(self, OutputFormat::H264 | OutputFormat::ProRes | OutputFormat::WebM | OutputFormat::Hevc | OutputFormat::Av1)
+        matches!(self, OutputFormat::H264 | OutputFormat::ProRes | OutputFormat::Uncompressed | OutputFormat::WebM | OutputFormat::Hevc | OutputFormat::Av1)
     }
     /// Formats whose video codec options live in [`OutputModule::codec`] (HEVC, AV1).
     pub fn has_codec_options(self) -> bool {
@@ -597,8 +602,8 @@ impl OutputFormat {
         let even = |v: u32| if v < 2 { 2 } else { v & !1 };
         if matches!(self, OutputFormat::H264 | OutputFormat::Hevc) { (even(w), even(h)) } else { (w, h) }
     }
-    /// Parse a format name: `h264`, `mp4`, `prores`, `mov`, `png`, `jpeg`/`jpg`, `tiff`/`tif`,
-    /// `exr`, `gif`, or a label.
+    /// Parse a format name: `h264`, `mp4`, `prores`, `mov`, `uncompressed`, `png`, `jpeg`/`jpg`,
+    /// `tiff`/`tif`, `exr`, `gif`, or a label.
     pub fn from_name(s: &str) -> Option<OutputFormat> {
         let n = s.trim().to_ascii_lowercase().replace([' ', '.', '-', '_'], "");
         Some(match n.as_str() {
@@ -606,6 +611,7 @@ impl OutputFormat {
             "hevc" | "h265" | "hevch265" | "hvc1" | "x265" => OutputFormat::Hevc,
             "av1" | "av01" | "mp4av1" => OutputFormat::Av1,
             "prores" | "mov" | "quicktime" | "quicktimeprores" => OutputFormat::ProRes,
+            "uncompressed" | "quicktimeuncompressed" | "rawvideo" => OutputFormat::Uncompressed,
             "png" | "pngsequence" => OutputFormat::PngSequence,
             "jpg" | "jpeg" | "jpegsequence" => OutputFormat::JpegSequence,
             "tif" | "tiff" | "tiffsequence" => OutputFormat::TiffSequence,
@@ -622,6 +628,51 @@ impl OutputFormat {
         let ext = std::path::Path::new(path).extension()?.to_string_lossy().to_ascii_lowercase();
         OutputFormat::from_name(&ext)
     }
+    /// An output `path` without its extensions, for this format to add its own: the project
+    /// extensions a save dialog filtered to projects appended (`Comp 1.png.ecproj`, #293), one
+    /// output format's extension (the one being replaced), and any more of this format's
+    /// (`Comp 2.mov.mov`, from a format change or a comp named `Comp 2.mov`). Another extension
+    /// stays part of the name (`logo.png.mov`).
+    pub fn output_stem(self, path: &str) -> &str {
+        let stem = without_project_extension(path);
+        let mut stem = strip_extension(stem, |e| OutputFormat::from_name(e).is_some()).unwrap_or(stem);
+        while let Some(s) = strip_extension(stem, |e| e.eq_ignore_ascii_case(self.extension())) {
+            stem = s;
+        }
+        stem
+    }
+    /// `path` ending in this format's extension exactly once (see [`OutputFormat::output_stem`]);
+    /// a path that already does is kept as it is. Templates still to expand `[fileExtension]` are
+    /// kept too.
+    pub fn with_extension(self, path: &str) -> String {
+        if path.contains("[fileExtension]") {
+            return path.to_string();
+        }
+        let fixed = format!("{}.{}", self.output_stem(path), self.extension());
+        if fixed.eq_ignore_ascii_case(path) { path.to_string() } else { fixed }
+    }
+}
+
+/// Project file extensions: never a render's output.
+const PROJECT_EXTENSIONS: [&str; 2] = ["ecproj", "ecprojx"];
+
+/// An output `path` without the project extensions a save dialog filtered to projects appended
+/// to it (`Comp 1.mov.ecproj` → `Comp 1.mov`, #293).
+pub fn without_project_extension(path: &str) -> &str {
+    let mut p = path;
+    while let Some(s) = strip_extension(p, |e| PROJECT_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x))) {
+        p = s;
+    }
+    p
+}
+
+/// `path` without its last extension when `strip` accepts that extension.
+fn strip_extension(path: &str, strip: impl Fn(&str) -> bool) -> Option<&str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    if !strip(ext) {
+        return None;
+    }
+    path.strip_suffix(ext)?.strip_suffix('.')
 }
 
 /// Output Module ▸ Channels.
@@ -1130,8 +1181,7 @@ impl OutputModule {
             }
             return;
         }
-        let p = std::path::Path::new(&self.output);
-        let mut stem = p.with_extension("").to_string_lossy().to_string();
+        let mut stem = format.output_stem(&self.output).to_string();
         if format.is_sequence() && !stem.contains('#') {
             stem.push_str("_[#####]");
         } else if !format.is_sequence() {
@@ -1451,6 +1501,42 @@ mod tests {
         assert_eq!(ProResProfile::from_name("hq"), Some(ProResProfile::Hq));
     }
 
+    /// Output names end in the format's extension exactly once (#293): a save dialog filtered to
+    /// projects appended `.ecproj` (`Comp 1.mov.ecproj`, `Comp 1_00001.png.ecproj` for every
+    /// frame), and a format change or a comp named `Comp 2.mov` doubled it (`Comp 2.mov.mov`).
+    #[test]
+    fn output_names_end_in_the_format_extension_once() {
+        use OutputFormat::*;
+        for (path, format, want) in [
+            ("/out/Comp 1.mov.ecproj", ProRes, "/out/Comp 1.mov"),
+            ("/out/Comp 1_[#####].png.ecproj", PngSequence, "/out/Comp 1_[#####].png"),
+            ("/out/Comp 1.mov.ecprojx.ecproj", ProRes, "/out/Comp 1.mov"),
+            ("/out/Comp 2.mov.mov", ProRes, "/out/Comp 2.mov"),
+            ("/out/Comp 2.mov.mov.mov", ProRes, "/out/Comp 2.mov"),
+            ("/out/render", ProRes, "/out/render.mov"),
+            ("/out/frames_[#####]", PngSequence, "/out/frames_[#####].png"),
+            ("/out/logo.png.mov", ProRes, "/out/logo.png.mov"),
+            ("/out/v1.2", H264, "/out/v1.2.mp4"),
+            ("/my.folder/Clip.MOV", ProRes, "/my.folder/Clip.MOV"),
+            ("/out/x.mp4", Hevc, "/out/x.mp4"),
+            ("[compName].[fileExtension]", ProRes, "[compName].[fileExtension]"),
+        ] {
+            assert_eq!(format.with_extension(path), want, "{path} as {format:?}");
+        }
+        assert_eq!(without_project_extension("C:/out/Comp 1.mov.ecproj"), "C:/out/Comp 1.mov");
+        assert_eq!(without_project_extension("Comp 1.mov"), "Comp 1.mov");
+        // Changing the format replaces one extension and drops the project one.
+        let mut m = OutputModule { output: "/out/Comp 1.mov.ecproj".into(), ..OutputModule::for_format(ProRes) };
+        m.set_format(H264);
+        assert_eq!(m.output, "/out/Comp 1.mp4");
+        m.output = "/out/Comp 2.mov.mov".into();
+        m.set_format(ProRes);
+        assert_eq!(m.output, "/out/Comp 2.mov");
+        m.output = "/out/Comp 2.mov.ecproj".into();
+        m.set_format(PngSequence);
+        assert_eq!(m.output, "/out/Comp 2_[#####].png");
+    }
+
     #[test]
     fn pulldown_cadence() {
         assert_eq!(Pulldown::Wwssw.pattern(), "WWSSW");
@@ -1555,6 +1641,25 @@ mod tests {
         assert_eq!(s.frame_count(&c), 30);
         assert_eq!(s.first_frame(&c), 30);
         assert!(s.frame_time(&c, 0) >= Tick::from_seconds_f64(1.0));
+    }
+
+    #[test]
+    fn uncompressed_quicktime_format() {
+        let f = OutputFormat::from_name("uncompressed").unwrap();
+        assert_eq!(f, OutputFormat::Uncompressed);
+        assert_eq!(OutputFormat::from_name(&format!("{f:?}")), Some(f));
+        assert!(OutputFormat::ALL.contains(&f));
+        assert!(f.is_movie() && f.supports_alpha() && f.supports_audio());
+        assert_eq!(f.coded_size(3, 5), (3, 5));
+        // `.mov` still guesses ProRes; switching keeps the name.
+        assert_eq!(OutputFormat::from_path("a.mov"), Some(OutputFormat::ProRes));
+        let mut m = OutputModule::for_format(OutputFormat::ProRes);
+        m.output = "/out/Comp 1.mov".into();
+        m.channels = Channels::Rgba;
+        m.set_format(f);
+        assert_eq!((m.output.as_str(), m.channels), ("/out/Comp 1.mov", Channels::Rgba));
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<OutputModule>(&json).unwrap().format, f);
     }
 
     #[test]

@@ -1,32 +1,28 @@
 //! Probing: describe a file as an [`effectcraft_project::Footage`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind};
 use effectcraft_time::{FrameRate, Tick};
+use image::metadata::Orientation;
 
-use crate::{MediaError, Result, STILL_EXTENSIONS, ext_of, rate_from_fc};
+use crate::{MediaError, Result, ext_of, rate_from_fc};
 
 /// Frame rate given to image sequences on import (After Effects' default preference).
 pub const DEFAULT_SEQUENCE_RATE: FrameRate = FrameRate::FPS_30;
 
-/// Probe a file. Stills whose name ends in a frame number (`shot_0001.png`) with at least one
-/// numbered sibling are imported as an image sequence; use [`probe_single`] to import one frame.
+/// Probe one file. Image sequences are made by the engine, which groups numbered stills
+/// (`effectcraft_engine::sequence`) and probes their first frame here.
 pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     let path = path.as_ref();
-    if STILL_EXTENSIONS.contains(&ext_of(path).as_str()) {
-        let files = sequence_files(path);
-        if files.len() >= 2 {
-            return probe_sequence(&files);
-        }
+    // A movie is read in place (its index), not loaded whole.
+    if let Some(src) = crate::stream::probe_source(path) {
+        let mut f = footage_from_info(&path.to_string_lossy(), src?.info());
+        let turn = crate::stream::movie_header(path).map_or(Orientation::NoTransforms, |h| video_turn(&h));
+        turn_footage(&mut f, turn);
+        return Ok(f);
     }
-    probe_single(path)
-}
-
-/// Probe a file without image-sequence detection.
-pub fn probe_single(path: impl AsRef<Path>) -> Result<Footage> {
-    let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
     if crate::MODEL_EXTENSIONS.contains(&ext_of(path).as_str()) {
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -35,7 +31,7 @@ pub fn probe_single(path: impl AsRef<Path>) -> Result<Footage> {
     probe_bytes(&path.to_string_lossy(), bytes.into())
 }
 
-/// Probe a 3D model (glTF 2.0 / OBJ): a [`FootageKind::Model`] item whose duration is its
+/// Probe a 3D model (glTF 2.0 / OBJ / STL / FBX): a [`FootageKind::Model`] item whose duration is its
 /// longest animation. `resolve` reads sibling resources.
 pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Footage> {
     let m = effectcraft_model::load(path, bytes, resolve).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
@@ -43,6 +39,8 @@ pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Ve
     let dur = s.animations.iter().map(|a| a.1).fold(0.0f64, f64::max);
     let codec = match effectcraft_model::format_of(path) {
         Some("obj") => "OBJ",
+        Some("stl") => "STL",
+        Some("fbx") => "FBX",
         Some("glb") => "GLB",
         _ => "glTF",
     };
@@ -70,18 +68,47 @@ pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Ve
 
 /// Probe in-memory file contents; `path` names the footage (and is stored as `Footage::path`).
 pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
+    // DPX / Cineon film scans (our own reader; `image` has none).
+    if let Some(f) = crate::dpx::probe(path, &bytes)? {
+        return Ok(f);
+    }
     if let Some(f) = crate::layered::probe(path, &bytes)? {
         return Ok(f);
     }
     if crate::MODEL_EXTENSIONS.contains(&ext_of(Path::new(path)).as_str()) {
         return probe_model(path, &bytes, &|_| None);
     }
-    if let Ok(fmt) = image::guess_format(&bytes) {
+    if let Some(fmt) = crate::still_format(path, &bytes) {
+        // An animated GIF is a movie; one with a single frame is a still.
+        if fmt == image::ImageFormat::Gif
+            && let Some(f) = crate::gif_anim::probe(path, &bytes)
+        {
+            return Ok(f);
+        }
+        // So is an animated WebP; a still WebP stays a still.
+        if fmt == image::ImageFormat::WebP
+            && let Some(f) = crate::webp_anim::probe(path, &bytes)
+        {
+            return Ok(f);
+        }
         return probe_still_bytes(path, &bytes, fmt);
     }
     let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+    let turn = video_turn(&bytes);
     let src = filmcraft_codecs::open_bytes(&name, bytes)?;
-    Ok(footage_from_info(path, src.info()))
+    let mut f = footage_from_info(path, src.info());
+    turn_footage(&mut f, turn);
+    Ok(f)
+}
+
+/// The size as displayed: a movie shot with the camera on its side trades width and height.
+fn turn_footage(f: &mut Footage, turn: Orientation) {
+    if swaps_sides(turn) {
+        std::mem::swap(&mut f.width, &mut f.height);
+        if f.pixel_aspect > 0.0 {
+            f.pixel_aspect = 1.0 / f.pixel_aspect;
+        }
+    }
 }
 
 pub(crate) fn footage_from_info(path: &str, info: &filmcraft_media::MediaInfo) -> Footage {
@@ -164,65 +191,66 @@ pub(crate) fn still_footage(path: &str, w: u32, h: u32, fmt: image::ImageFormat,
 
 fn probe_still_bytes(path: &str, bytes: &[u8], fmt: image::ImageFormat) -> Result<Footage> {
     use image::ImageDecoder;
+    if fmt == image::ImageFormat::OpenExr
+        && let Some(why) = crate::exr_channels::unsupported_compression(bytes)
+    {
+        return Err(MediaError::Decode(format!("{path}: {why}")));
+    }
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt);
-    let dec = reader.into_decoder().map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
-    let (w, h) = dec.dimensions();
-    let has_alpha = dec.color_type().has_alpha();
+    let (w, h, has_alpha) = match reader.into_decoder() {
+        Ok(mut dec) => {
+            // The size as displayed: an Exif orientation of a quarter turn swaps the sides.
+            let (w, h) = dec.dimensions();
+            let (w, h) = if swaps_sides(dec.orientation().unwrap_or(Orientation::NoTransforms)) { (h, w) } else { (w, h) };
+            (w, h, dec.color_type().has_alpha())
+        }
+        Err(e) => {
+            // A multi-layer OpenEXR file without an unnamed RGB layer.
+            let img = (fmt == image::ImageFormat::OpenExr).then(|| crate::exr_channels::layered_image(bytes)).flatten();
+            let img = img.ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?;
+            (img.width(), img.height(), img.color().has_alpha())
+        }
+    };
     Ok(still_footage(path, w, h, fmt, has_alpha))
 }
 
-fn probe_sequence(files: &[PathBuf]) -> Result<Footage> {
-    let first = &files[0];
-    let mut f = probe_single(first)?;
-    f.kind = FootageKind::Sequence;
-    f.frame_rate = DEFAULT_SEQUENCE_RATE;
-    f.duration = DEFAULT_SEQUENCE_RATE.tick_of(files.len() as i64);
-    f.sequence = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
-    Ok(f)
+/// Whether an Exif orientation turns the picture a quarter turn (its width and height trade places).
+pub(crate) fn swaps_sides(o: Orientation) -> bool {
+    matches!(o, Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH)
 }
 
-/// Split a file stem into (prefix, frame number digits). `None` when it does not end in digits.
-fn split_number(stem: &str) -> Option<(&str, &str)> {
-    let digits = stem.bytes().rev().take_while(u8::is_ascii_digit).count();
-    (digits > 0).then(|| stem.split_at(stem.len() - digits))
+/// Decode a still the way it is meant to be seen: its Exif orientation (a camera held sideways, a
+/// mirrored scan) is applied to the pixels, as image viewers do. A file without
+/// the tag, or with a broken one, decodes as stored. `fmt`: the format when the file's extension
+/// decides it (Targa has no signature to guess from), else guessed from the bytes.
+pub(crate) fn load_oriented(bytes: &[u8], fmt: Option<image::ImageFormat>) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let reader = match fmt {
+        Some(fmt) => image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt),
+        None => image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?,
+    };
+    let mut dec = reader.into_decoder()?;
+    let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(dec)?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }
 
-/// The numbered files of the image sequence `path` belongs to (sorted by frame number; empty when
-/// the name has no frame number). Siblings must share the prefix and extension.
-pub fn sequence_files(path: impl AsRef<Path>) -> Vec<PathBuf> {
-    let path = path.as_ref();
-    let ext = ext_of(path);
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return Vec::new() };
-    let Some((prefix, _)) = split_number(stem) else { return Vec::new() };
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<(u64, PathBuf)> = rd
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            if ext_of(&p) != ext || !p.is_file() {
-                return None;
-            }
-            let s = p.file_stem()?.to_str()?;
-            let (pre, num) = split_number(s)?;
-            if pre != prefix {
-                return None;
-            }
-            Some((num.parse().ok()?, p))
-        })
-        .collect();
-    out.sort();
-    out.into_iter().map(|(_, p)| p).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_numbers() {
-        assert_eq!(split_number("shot_0012"), Some(("shot_", "0012")));
-        assert_eq!(split_number("shot"), None);
-        assert_eq!(split_number("v2_10"), Some(("v2_", "10")));
+/// The rotation an MP4/MOV movie is shown with (a phone held upright records sideways frames and
+/// says so in its video track's header): the quarter turn nearest the track's rotation. Only the
+/// rotation counts; any mirroring, scaling or offset in the header is ignored, and other
+/// containers have none.
+pub(crate) fn video_turn(bytes: &[u8]) -> Orientation {
+    let Ok(file) = filmcraft_isobmff::open(bytes) else { return Orientation::NoTransforms };
+    let Some(m) = file.tracks.iter().find(|t| t.kind == filmcraft_isobmff::TrackKind::Video).map(|t| t.matrix) else {
+        return Orientation::NoTransforms;
+    };
+    // [a b u; c d v; x y w]: (a, b) is where the picture's x axis points.
+    let (a, b) = (m[0] as i64, m[1] as i64);
+    match (a.abs() >= b.abs(), a >= 0, b >= 0) {
+        (true, true, _) => Orientation::NoTransforms,
+        (true, false, _) => Orientation::Rotate180,
+        (false, _, true) => Orientation::Rotate90,
+        (false, _, false) => Orientation::Rotate270,
     }
 }

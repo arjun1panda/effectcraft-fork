@@ -63,6 +63,41 @@ impl AuxChannels {
         self.channels.iter().map(|(n, _)| n.as_str()).collect()
     }
 
+    /// The layers of the channels (OpenEXR layers: the name before the last `.`; `""` for the
+    /// unnamed layer), in channel order.
+    pub fn layers(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = vec![];
+        for (n, _) in &self.channels {
+            let (layer, _) = split_channel(n);
+            if !out.contains(&layer) {
+                out.push(layer);
+            }
+        }
+        out
+    }
+
+    /// A layer's channels as the names to show in red, green, blue and alpha (`""` = none):
+    /// its R, G, B, A channels (or red / green / blue / alpha, X / Y / Z, U / V); a layer of one
+    /// channel (depth, an ID) shows it in all three colours.
+    pub fn layer_rgba(&self, layer: &str) -> [String; 4] {
+        let chans: Vec<&str> = self.channels.iter().map(|(n, _)| n.as_str()).filter(|n| split_channel(n).0 == layer).collect();
+        let pick = |names: &[&str]| -> String {
+            chans.iter().find(|c| names.iter().any(|n| split_channel(c).1.eq_ignore_ascii_case(n))).map_or(String::new(), |c| c.to_string())
+        };
+        if let [one] = chans.as_slice() {
+            return [one.to_string(), one.to_string(), one.to_string(), String::new()];
+        }
+        [pick(&["R", "red", "X", "U"]), pick(&["G", "green", "Y", "V"]), pick(&["B", "blue", "Z"]), pick(&["A", "alpha"])]
+    }
+}
+
+/// A channel name's layer and channel: `diffuse.R` → (`diffuse`, `R`), `ViewLayer.Combined.R`
+/// → (`ViewLayer.Combined`, `R`), `Z` → (`""`, `Z`).
+pub fn split_channel(name: &str) -> (&str, &str) {
+    name.rsplit_once('.').unwrap_or(("", name))
+}
+
+impl AuxChannels {
     pub fn depth(&self) -> Option<&[f32]> {
         self.find(&["Z", "depth", "Depth", "zDepth", "Z-Depth"])
     }
@@ -85,8 +120,11 @@ impl AuxChannels {
         v
     }
 
-    /// Rank pairs (id, coverage) of Cryptomatte layer `layer` at aux pixel index `i`.
-    pub fn crypto_ranks(&self, layer: &str, i: usize) -> Vec<(f32, f32)> {
+    /// The rank planes of Cryptomatte layer `layer`, in rank order: (ID plane, coverage plane)
+    /// for `layer00.R/G`, `layer00.B/A`, `layer01.R/G`, ... Resolve them once per evaluation and
+    /// index them per pixel; looking the channels up by name for every pixel is what made the
+    /// effect slow.
+    pub fn crypto_rank_planes(&self, layer: &str) -> Vec<(&[f32], &[f32])> {
         let mut out = vec![];
         for k in 0.. {
             let (r, g, b, a) = (
@@ -96,12 +134,18 @@ impl AuxChannels {
                 self.get(&format!("{layer}{k:02}.A")),
             );
             let (Some(r), Some(g)) = (r, g) else { break };
-            out.push((r[i], g[i]));
+            out.push((r, g));
             if let (Some(b), Some(a)) = (b, a) {
-                out.push((b[i], a[i]));
+                out.push((b, a));
             }
         }
         out
+    }
+
+    /// Rank pairs (id, coverage) of Cryptomatte layer `layer` at aux pixel index `i`. For a
+    /// loop over pixels, use [`AuxChannels::crypto_rank_planes`] once instead.
+    pub fn crypto_ranks(&self, layer: &str, i: usize) -> Vec<(f32, f32)> {
+        self.crypto_rank_planes(layer).iter().map(|(id, c)| (id[i], c[i])).collect()
     }
 
     /// Aux pixel index of a layer-space point (nearest; `None` outside).
@@ -201,5 +245,33 @@ mod tests {
         assert_eq!(a.crypto_ranks("CryptoObject", 0), vec![(1.0, 0.5)]);
         assert_eq!(a.index_at(1.5, 0.2), Some(1));
         assert_eq!(a.index_at(2.5, 0.2), None);
+    }
+
+    /// The rank planes come in rank order (00.R/G, 00.B/A, 01.R/G, ...), match lowercase channel
+    /// names as Blender writes them, stop at the first missing rank and agree with
+    /// `crypto_ranks` at every pixel.
+    #[test]
+    fn crypto_rank_planes_resolve_ranks_in_order() {
+        let mut a = AuxChannels::new(2, 1, 1.0);
+        for (n, v) in [
+            ("00.r", [1.0, 2.0]),
+            ("00.g", [0.5, 0.6]),
+            ("00.b", [3.0, 4.0]),
+            ("00.a", [0.25, 0.3]),
+            ("01.R", [5.0, 6.0]),
+            ("01.G", [0.1, 0.2]),
+            ("03.R", [9.0, 9.0]),
+            ("03.G", [1.0, 1.0]),
+        ] {
+            a.channels.push((format!("CryptoMaterial{n}"), v.to_vec()));
+        }
+        let planes = a.crypto_rank_planes("CryptoMaterial");
+        let ids: Vec<f32> = planes.iter().map(|(id, _)| id[1]).collect();
+        assert_eq!(ids, vec![2.0, 4.0, 6.0]);
+        for i in 0..2 {
+            let from_planes: Vec<(f32, f32)> = planes.iter().map(|(id, c)| (id[i], c[i])).collect();
+            assert_eq!(from_planes, a.crypto_ranks("CryptoMaterial", i));
+        }
+        assert!(a.crypto_rank_planes("CryptoObject").is_empty());
     }
 }

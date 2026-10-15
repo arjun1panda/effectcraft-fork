@@ -194,10 +194,10 @@ pub struct Entry {
 }
 
 const VIDEO: &[&str] = &["mp4", "m4v", "mov", "webm", "mkv", "avi", "mxf", "gif"];
-const IMAGE: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "exr", "bmp", "webp", "psd", "psb", "svg", "tga", "dpx", "hdr"];
+const IMAGE: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "exr", "bmp", "webp", "psd", "psb", "svg", "tga", "dpx", "cin", "hdr"];
 const AUDIO: &[&str] = &["wav", "aif", "aiff", "mp3", "m4a", "aac", "flac", "ogg", "opus"];
 const DATA: &[&str] = &["json", "csv", "tsv", "mgjson"];
-const MODEL: &[&str] = &["gltf", "glb", "obj"];
+const MODEL: &[&str] = &["gltf", "glb", "obj", "stl", "fbx"];
 
 /// Kind of file from its extension.
 pub fn kind_of(path: &str) -> Option<&'static str> {
@@ -318,6 +318,7 @@ pub fn footage_metadata(f: &Footage) -> Value {
         "alpha": format!("{:?}", f.alpha),
         "colorProfile": f.color_profile.map(|c| format!("{c:?}")).unwrap_or_else(|| "sRGB (default)".into()),
         "linearLight": f.linear_light,
+        "preserveRgb": f.preserve_rgb,
         "fields": format!("{:?}", f.fields),
         "sequenceFiles": f.sequence.len(),
         "dataRows": f.data.as_ref().map(|d| d.lines().count().saturating_sub(1)),

@@ -3,9 +3,9 @@
 
 use effectcraft_engine::Session;
 use effectcraft_engine::color::Label;
-use effectcraft_engine::project::{ItemId, ItemKind};
-use effectcraft_ui_egui::EffectcraftApp;
-use egui::{Event, Modifiers, Pos2, pos2};
+use effectcraft_engine::project::{Footage, FootageKind, ItemId, ItemKind};
+use effectcraft_ui_egui::{Dialog, EffectcraftApp};
+use egui::{Color32, Event, Modifiers, Pos2, Rect, pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use serde_json::json;
@@ -60,6 +60,31 @@ fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
 }
 
 #[test]
+fn command_clicking_a_folder_twirl_opens_the_folders_inside_it() {
+    let (mut h, folder, _, _) = harness();
+    let s = &mut h.state_mut().session;
+    let inner = s.execute("project.newFolder", json!({"name": "Inner"})).unwrap()["item"].as_u64().unwrap();
+    let deep = s.execute("project.newFolder", json!({"name": "Deep"})).unwrap()["item"].as_u64().unwrap();
+    s.execute("project.move", json!({"items": [inner], "folder": folder.0})).unwrap();
+    s.execute("project.move", json!({"items": [deep], "folder": inner})).unwrap();
+    s.execute("project.select", json!({"items": []})).unwrap();
+    h.state_mut().ui.project_open_folders.clear();
+    h.run_steps(3);
+    let p = center(&h, &format!("project.item.{}.twirl", folder.0));
+    let cmd_click = |h: &mut Harness<'_, EffectcraftApp>| {
+        h.input_mut().events.push(Event::ModifiersChanged(Modifiers::COMMAND));
+        click_at(h, p);
+        h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+        h.step();
+    };
+    cmd_click(&mut h);
+    let open = h.state().ui.project_open_folders.clone();
+    assert!([folder.0, inner, deep].iter().all(|f| open.contains(f)), "the folder and every folder inside it open");
+    cmd_click(&mut h);
+    assert!(h.state().ui.project_open_folders.is_empty(), "and close again together");
+}
+
+#[test]
 fn folder_twirl_opens_and_closes_the_folder_on_one_click() {
     let (mut h, folder, comp, _) = harness();
     let twirl = format!("project.item.{}.twirl", folder.0);
@@ -80,6 +105,18 @@ fn folder_twirl_opens_and_closes_the_folder_on_one_click() {
     assert!(h.state().ui.project_open_folders.contains(&folder.0), "a double-click on the row opens the folder");
 }
 
+/// A swatch (a small rect filled with `col`) painted this frame in the left half of `row`.
+fn swatch_in(h: &Harness<'_, EffectcraftApp>, row: Rect, col: Color32) -> bool {
+    fn walk(s: &egui::Shape, row: Rect, col: Color32) -> bool {
+        match s {
+            egui::Shape::Rect(r) => r.fill == col && r.rect.width() < 16.0 && row.contains(r.rect.center()) && r.rect.center().x < row.center().x,
+            egui::Shape::Vec(v) => v.iter().any(|s| walk(s, row, col)),
+            _ => false,
+        }
+    }
+    h.output().shapes.iter().any(|c| walk(&c.shape, row, col))
+}
+
 #[test]
 fn label_swatch_opens_the_label_menu() {
     let (mut h, _, _, solid) = harness();
@@ -89,11 +126,82 @@ fn label_swatch_opens_the_label_menu() {
     click(&mut h, &format!("project.item.{}.label", solid.0));
     assert!(h.state().session.state.project_selection.is_empty(), "the swatch does not select the row");
     let entry = h.query_by_label(&green).expect("the label menu is open").rect();
+    // Each entry shows its colour before its name (#290).
+    assert!(swatch_in(&h, entry, h.state().tokens.label(Label::Green)), "no {green} swatch");
     let undo = h.state().session.history.undo.len();
     click_at(&mut h, entry.center());
     assert_eq!(h.state().session.project.item(solid).unwrap().label, Label::Green);
     assert_eq!(h.state().session.history.undo.len(), undo + 1);
     assert!(h.query_by_label(&green).is_none(), "the menu closed after the choice");
+}
+
+/// Right-clicking a footage item selects it and offers the File menu's footage commands:
+/// Interpret Footage ▸ Main... opens the Interpret Footage dialog on it (#290). A solid has none.
+#[test]
+fn footage_context_menu_interprets_the_footage() {
+    let (mut h, _, _, solid) = harness();
+    let footage = Footage { kind: FootageKind::Video, path: "clip.mp4".into(), width: 64, height: 36, has_video: true, ..Default::default() };
+    let clip = std::sync::Arc::make_mut(&mut h.state_mut().session.project).add_item("Clip", Default::default(), None, ItemKind::Footage(footage));
+    h.run_steps(2);
+    let right_click = |h: &mut Harness<'_, EffectcraftApp>, p: Pos2| {
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.step();
+        for pressed in [true, false] {
+            h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+            h.step();
+        }
+        h.run_steps(2);
+    };
+    // The menu's Interpret Footage entry, not the panel's footer button of the same name.
+    let menu_entry = |h: &Harness<'_, EffectcraftApp>| {
+        let footer = center(h, "project.interpret");
+        h.query_all_by_label_contains("Interpret Footage").find(|n| !n.rect().contains(footer)).map(|n| n.rect())
+    };
+    let at = center(&h, &format!("project.item.{}.name", solid.0));
+    right_click(&mut h, at);
+    assert_eq!(h.state().session.state.project_selection, vec![solid]);
+    assert!(menu_entry(&h).is_none(), "a solid isn't footage");
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", clip.0));
+    right_click(&mut h, at);
+    assert_eq!(h.state().session.state.project_selection, vec![clip], "right-click selects the item");
+    let sub = menu_entry(&h).expect("Interpret Footage in the menu");
+    h.input_mut().events.push(Event::PointerMoved(sub.center()));
+    h.run_steps(3);
+    let main = h.query_by_label_contains("Main...").expect("Interpret Footage ▸ Main...").rect();
+    for k in 0..=6 {
+        h.input_mut().events.push(Event::PointerMoved(pos2(main.center().x, sub.center().y + (main.center().y - sub.center().y) * k as f32 / 6.0)));
+        h.step();
+    }
+    click_at(&mut h, main.center());
+    assert_eq!(h.state().dialog, Some(Dialog::Form), "the Interpret Footage dialog opened");
+}
+
+/// #360: the row menu's New Comp from Selection works on the whole selection, as File ▸ New
+/// Comp from Selection does: with several items selected it asks how in After Effects' New
+/// Composition from Selection dialog, and Multiple Compositions makes one per item.
+#[test]
+fn context_menu_new_comp_from_selection_uses_the_selection() {
+    let (mut h, _, comp, solid) = harness();
+    h.state_mut().session.state.project_selection = vec![comp, solid];
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", solid.0));
+    h.input_mut().events.push(Event::PointerMoved(at));
+    h.step();
+    for pressed in [true, false] {
+        h.input_mut().events.push(Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().session.state.project_selection, vec![comp, solid], "the selection stays");
+    let item = h.query_by_label_contains("New Comp from Selection").expect("in the menu").rect();
+    click_at(&mut h, item.center());
+    assert_eq!(h.state().dialog, Some(Dialog::Form));
+    assert!(h.state().auto.find("form.field.single").is_some(), "the New Composition from Selection dialog");
+    let comps = h.state().session.project.comps().count();
+    h.state_mut().session.execute_checked("file.newCompFromSelection", json!({"single": false})).unwrap();
+    assert_eq!(h.state().session.project.comps().count(), comps + 2, "one per item");
 }
 
 /// Dragging from the Project panel's empty area draws a selection box that selects the rows it
@@ -130,4 +238,56 @@ fn a_short_project_panel_draws() {
         h.run_steps(3);
         assert!(h.state().auto.find("project.empty").is_some(), "the Project panel drew at {height} points");
     }
+}
+
+/// #1058: a comp's row menu offers Composition Settings…, as After Effects' does, for the comp
+/// right-clicked even when the viewer shows another one; OK applies to that comp. Footage has none.
+#[test]
+fn comp_context_menu_opens_that_comps_settings() {
+    let (mut h, _, main, _) = harness();
+    let s = &mut h.state_mut().session;
+    let side = ItemId(s.execute("comp.new", json!({"name": "Side", "width": 640, "height": 360, "duration": 2})).unwrap()["comp"].as_u64().unwrap());
+    s.execute("comp.open", json!({"comp": main.0})).unwrap();
+    let footage = Footage { kind: FootageKind::Video, path: "clip.mp4".into(), width: 64, height: 36, has_video: true, ..Default::default() };
+    let clip = std::sync::Arc::make_mut(&mut s.project).add_item("Clip", Default::default(), None, ItemKind::Footage(footage));
+    h.run_steps(2);
+    assert_eq!(h.state().session.active_comp_id(), Some(main));
+    let right_click = |h: &mut Harness<'_, EffectcraftApp>, p: Pos2| {
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.step();
+        for pressed in [true, false] {
+            h.input_mut().events.push(Event::PointerButton { pos: p, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE });
+            h.step();
+        }
+        h.run_steps(2);
+    };
+    let at = center(&h, &format!("project.item.{}.name", clip.0));
+    right_click(&mut h, at);
+    assert!(h.query_by_label("Rename").is_some(), "the footage menu is open");
+    assert!(h.query_by_label_contains("Composition Settings").is_none(), "footage isn't a comp");
+    h.input_mut().events.push(Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    let at = center(&h, &format!("project.item.{}.name", side.0));
+    right_click(&mut h, at);
+    let entry = h.query_by_label_contains("Composition Settings").expect("in the comp's menu").rect();
+    click_at(&mut h, entry.center());
+    assert_eq!(h.state().dialog, Some(Dialog::CompSettings));
+    assert_eq!(h.state().session.active_comp_id(), Some(main), "the viewer keeps its comp");
+    // A new name, then OK: Side's own size goes back to Side under it. Main's values in the
+    // dialog, or OK writing to the viewer's comp, would resize or rename the wrong one.
+    click(&mut h, "dialog.comp.name");
+    h.input_mut().events.push(Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
+    h.input_mut().events.push(Event::Text("Side 2".into()));
+    h.run_steps(2);
+    let undo = h.state().session.history.undo.len();
+    h.input_mut().events.push(Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    assert_eq!(h.state().dialog, None, "OK closed the dialog");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "OK applied the settings");
+    let size = |h: &Harness<'_, EffectcraftApp>, c: ItemId| {
+        let s = &h.state().session;
+        (s.project.item(c).unwrap().name.clone(), s.project.comp(c).unwrap().width, s.project.comp(c).unwrap().height)
+    };
+    assert_eq!(size(&h, side), ("Side 2".into(), 640, 360), "the dialog showed and set the right-clicked comp");
+    assert_eq!(size(&h, main), ("Main".into(), 320, 180), "the open comp is untouched");
 }
